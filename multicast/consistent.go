@@ -2,10 +2,10 @@ package multicast
 
 import (
 	"total-ordered-replicated-memcached/memcached"
+	"time"
 	"fmt"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 type Consistent struct {
@@ -25,7 +25,7 @@ type Consistent struct {
 
 func NewConsistent(mc *memcached.Client, id int, peers []int, func1 func(int, Packet), isSequencer bool, batchSize int) *Consistent {
 	c := &Consistent{mc: mc, ID: id, Peers: peers, Func1: func1, IsSequencer: isSequencer}
-	c.Cond = sync.NewCond(&sync.Mutex{})
+	c.Cond = sync.NewCond(&c.Mutex)
 	if isSequencer {
 		c.Sequencer = NewSequencer(batchSize, 10*time.Millisecond)
 		go c.runSequencer()
