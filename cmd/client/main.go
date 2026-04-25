@@ -31,8 +31,6 @@ func main() {
 	output := flag.String("output", "results.csv", "Output csv location")
 	flag.Parse()
 
-	rand.Seed(time.Now().UnixNano())
-
 	fmt.Println("...Pre-populating database...")
 	for i := 0; i < 100; i++ {
 		executeReq(targets[0], "SET", fmt.Sprintf("key_%d", i), fmt.Sprintf("value_%d", i), "pre-populate", 0)
@@ -48,25 +46,26 @@ func main() {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			clientName := fmt.Sprintf("client_%d", id)
+			clientID := fmt.Sprintf("client_%d", id)
 			var reqID int64 = 0
-			
+			target := targets[id % len(targets)] 
 			for {
 				select {
 				case <-stop:
 					return
 				default:
 					reqID++
-					target := targets[rand.Intn(len(targets))]
-					keyIdx := rand.Intn(100)
-					key := fmt.Sprintf("key_%d", keyIdx)
-					reqType := "GET"
-					val := ""
-					if rand.Float64() < *ratio {
+					key := fmt.Sprintf("key_%d", rand.Intn(100))
+					var reqType string
+					var val string
+					if rand.Float64() >= *ratio {
+						reqType = "GET"
+						val = ""
+					} else {
 						reqType = "SET"
 						val = fmt.Sprintf("value_%d", rand.Intn(10000)) 
 					}
-					result := executeReq(target, reqType, key, val, clientName, reqID)
+					result := executeReq(target, reqType, key, val, clientID, reqID)
 					results <- result
 				}
 			}
@@ -85,40 +84,38 @@ func main() {
 
 func executeReq(target string, reqType string, key string, value string, clientID string, reqID int64) Result {
 	start := time.Now()
-	conn, err := net.DialTimeout("tcp", target, 2*time.Second)
+	conn, err := net.DialTimeout("tcp", target, 5*time.Second)
 	if err != nil {
 		return Result{reqType, target, false, time.Since(start)}
 	}
 	defer conn.Close()
 	encoder := gob.NewEncoder(conn)
 	decoder := gob.NewDecoder(conn)
-	var packet multicast.Packet
-	if reqType == "SET" {
-		packet = multicast.Packet{
-			MsgType: multicast.ClientSetRequest,
-			Msg:     multicast.SetRequest{Key: key, Value: value, ClientID: clientID, RequestID: reqID},
-		}
+	var packetOut multicast.Packet
+	if reqType == "GET" {
+		packetOut = multicast.Packet{MsgType: multicast.ClientGetRequest, Msg: multicast.GetRequest{Key: key, ClientID: clientID, RequestID: reqID}}
 	} else {
-		packet = multicast.Packet{
-			MsgType: multicast.ClientGetRequest,
-			Msg:     multicast.GetRequest{Key: key, ClientID: clientID, RequestID: reqID},
-		}
+		packetOut = multicast.Packet{MsgType: multicast.ClientSetRequest, Msg: multicast.SetRequest{Key: key, Value: value, ClientID: clientID, RequestID: reqID}}
 	}
-	if err := encoder.Encode(packet); err != nil {
+	err := encoder.Encode(packetOut)
+	if err != nil {
 		return Result{reqType, target, false, time.Since(start)}
 	}
-	var respPacket multicast.Packet
-	if err := decoder.Decode(&respPacket); err != nil {
+	var packetIn multicast.Packet
+	err := decoder.Decode(&packetIn)
+	if err != nil {
 		return Result{reqType, target, false, time.Since(start)}
 	}
 	success := false
 	if reqType == "SET" {
-		if resp, ok := respPacket.Msg.(multicast.SetResponse); ok {
-			success = resp.Success
+		msg, ok := packetIn.Msg.(multicast.SetResponse)
+		if ok {
+			success = msg.Success
 		}
 	} else {
-		if resp, ok := respPacket.Msg.(multicast.GetResponse); ok {
-			success = resp.Success
+		msg, ok := packetIn.Msg.(multicast.GetResponse)
+		if ok {
+			success = msg.Success
 		}
 	}
 	return Result{reqType, target, success, time.Since(start)}
