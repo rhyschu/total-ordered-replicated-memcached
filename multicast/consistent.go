@@ -12,33 +12,34 @@ type Consistent struct {
 	mc             *memcached.Client
 	ID             int
 	Peers          []int
-	Func1          func(targetID int, pac Packet)
+	SendFunc       func(targetID int, pac Packet)
 	IsSequencer    bool
 	Sequencer      *Sequencer
 	HighestApplied int64
 	Mutex          sync.Mutex
 	Cond           *sync.Cond
+	PendingMsgs    map[int64]TOMulticast
 	RIMap          sync.Map
 	RICounter      int64
 	SetMap         sync.Map
 }
 
-func NewConsistent(mc *memcached.Client, id int, peers []int, func1 func(int, Packet), isSequencer bool, batchSize int) *Consistent {
-	c := &Consistent{mc: mc, ID: id, Peers: peers, Func1: func1, IsSequencer: isSequencer}
+func NewConsistent(mc *memcached.Client, id int, peers []int, sendFunc func(int, Packet), isSequencer bool, batchSize int) *Consistent {
+	c := &Consistent{mc: mc, ID: id, Peers: peers, SendFunc: sendFunc, IsSequencer: isSequencer, PendingMsgs: make(map[int64]TOMulticast)}
 	c.Cond = sync.NewCond(&c.Mutex)
 	if isSequencer {
-		c.Sequencer = NewSequencer(batchSize, 10*time.Millisecond)
-		go c.runSequencer()
+		c.Sequencer = NewSequencer(batchSize, 100*time.Millisecond)
+		go c.RunSequencer()
 	}
 	return c
 }
 
-func (p *Consistent) runSequencer() {
-	for msg := range p.Sequencer.MulticastChannel() {
+func (p *Consistent) RunSequencer() {
+	for msg := range p.Sequencer.MulticastChan {
 		pac := Packet{MsgType: ServerTOMulticast, Msg: msg}
 		p.HandleServerMsg(pac)
 		for _, peerID := range p.Peers {
-			go p.Func1(peerID, pac)
+			p.SendFunc(peerID, pac)
 		}
 	}
 }
@@ -51,8 +52,12 @@ func (p *Consistent) HandleClientGet(req GetRequest) GetResponse {
 		riID := atomic.AddInt64(&p.RICounter, 1)
 		ch := make(chan int64, 1)
 		p.RIMap.Store(riID, ch)
-		p.Func1(1, Packet{MsgType: ServerRIQuery, Msg: RIQuery{RequestID: riID, NodeID: p.ID}})
-		readIndex = <-ch
+		p.SendFunc(1, Packet{MsgType: ServerRIQuery, Msg: RIQuery{RequestID: riID, NodeID: p.ID}})
+		select {
+		case readIndex = <-ch:
+		case <-time.After(5*time.Second):
+			return GetResponse{Success: false, RequestID: req.RequestID}
+		}
 		p.RIMap.Delete(riID)
 	}
 	p.Mutex.Lock()
@@ -66,14 +71,20 @@ func (p *Consistent) HandleClientGet(req GetRequest) GetResponse {
 
 func (p *Consistent) HandleClientSet(req SetRequest) SetResponse {
 	done := make(chan bool, 1)
-	p.SetMap.Store(req.RequestID, done)
+	key := fmt.Sprintf("%s_%d", req.ClientID, req.RequestID)
+	p.SetMap.Store(key, done)
 	if p.IsSequencer {
 		p.Sequencer.AddSet(req)
 	} else {
-		p.Func1(1, Packet{MsgType: ServerForwardSet, Msg: ForwardSet{Request: req, SourceID: p.ID}})
+		p.SendFunc(1, Packet{MsgType: ServerForwardSet, Msg: ForwardSet{Request: req, SourceID: p.ID}})
 	}
-	success := <-done
-	p.SetMap.Delete(req.RequestID)
+	success := false
+	select {
+	case success = <-done:
+	case <-time.After(5*time.Second):
+		success = false
+	}
+	p.SetMap.Delete(key)
 	return SetResponse{Success: success, RequestID: req.RequestID}
 }
 
@@ -85,21 +96,34 @@ func (p *Consistent) HandleServerMsg(pac Packet) error {
 		}
 	case ServerTOMulticast:
 		msg := pac.Msg.(TOMulticast)
-		for _, req := range msg.Batch {
-			p.mc.Set(req.Key, req.Value)
-			ch, ok := p.SetMap.Load(req.RequestID)
-			if ok {
-				ch.(chan bool) <- true
-			}
-		}
 		p.Mutex.Lock()
-		p.HighestApplied = msg.SequenceNumber
-		p.Cond.Broadcast()
+		if msg.SequenceNumber <= p.HighestApplied {
+			p.Mutex.Unlock()
+			return nil
+		}
+		p.PendingMsgs[msg.SequenceNumber] = msg
+		for {
+			nextSeq := p.HighestApplied + 1
+			nextMsg, ok := p.PendingMsgs[nextSeq]
+			if !ok {
+				break
+			}
+			for _, req := range nextMsg.Batch {
+				p.mc.Set(req.Key, req.Value)
+				key := fmt.Sprintf("%s_%d", req.ClientID, req.RequestID)
+				if ch, ok := p.SetMap.Load(key); ok {
+					ch.(chan bool) <- true
+				}
+			}
+			p.HighestApplied = nextSeq
+			delete(p.PendingMsgs, nextSeq)
+			p.Cond.Broadcast()
+		}
 		p.Mutex.Unlock()
 	case ServerRIQuery:
 		if p.IsSequencer {
 			msg := pac.Msg.(RIQuery)
-			p.Func1(msg.NodeID, Packet{MsgType: ServerRIResponse, Msg: RIResponse{LastSequence: p.Sequencer.GetCurrentSeq(), RequestID: msg.RequestID}})
+			p.SendFunc(msg.NodeID, Packet{MsgType: ServerRIResponse, Msg: RIResponse{LastSequence: p.Sequencer.GetCurrentSeq(), RequestID: msg.RequestID}})
 		}
 	case ServerRIResponse:
 		msg := pac.Msg.(RIResponse)

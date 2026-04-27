@@ -2,7 +2,6 @@ package multicast
 
 import (
 	"encoding/gob"
-	"time"
 )
 
 type MsgType int
@@ -82,23 +81,4 @@ type ConsistencyProtocol interface {
 	HandleClientGet(req GetRequest) GetResponse
 	HandleClientSet(req SetRequest) SetResponse
 	HandleServerMsg(pac Packet) error
-}
-
-type ServerConfig struct {
-	ID                int
-	Port              string
-	MemcachedID       string
-	Peers             []string
-	IsConsistent      bool
-	IsSequencer       bool
-	BatchSize         int
-	ArtificialLatency time.Duration
-}
-
-type ClientConfig struct {
-	Targets   []string
-	Ratio     float64
-	UserCount int
-	Duration  time.Duration
-	Output    string
 }

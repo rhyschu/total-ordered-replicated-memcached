@@ -58,9 +58,8 @@ func (s *Sequencer) resetTimer() {
 func (s *Sequencer) GetCurrentSeq() int64 {
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
+	if len(s.Batch) > 0 {
+		return s.CurrentSeq + 1
+	}
 	return s.CurrentSeq
-}
-
-func (s *Sequencer) MulticastChannel() <-chan TOMulticast {
-	return s.MulticastChan
 }

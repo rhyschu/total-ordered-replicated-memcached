@@ -6,14 +6,14 @@ import (
 )
 
 type Inconsistent struct {
-	mc    *memcached.Client
-	ID    int
-	Peers []int
-	Func1 func(targetID int, pac Packet)
+	mc       *memcached.Client
+	ID       int
+	Peers    []int
+	SendFunc func(targetID int, pac Packet)
 }
 
-func NewInconsistent(mc *memcached.Client, id int, peers []int, func1 func(int, Packet)) *Inconsistent {
-	return &Inconsistent{mc: mc, ID: id, Peers: peers, Func1: func1}
+func NewInconsistent(mc *memcached.Client, id int, peers []int, sendFunc func(int, Packet)) *Inconsistent {
+	return &Inconsistent{mc: mc, ID: id, Peers: peers, SendFunc: sendFunc}
 }
 
 func (p *Inconsistent) HandleClientGet(req GetRequest) GetResponse {
@@ -25,7 +25,7 @@ func (p *Inconsistent) HandleClientSet(req SetRequest) SetResponse {
 	success := p.mc.Set(req.Key, req.Value)
 	msg := Packet{MsgType: ServerForwardSet, Msg: ForwardSet{Request: req, SourceID: p.ID}}
 	for _, peerID := range p.Peers {
-		go p.Func1(peerID, msg)
+		go p.SendFunc(peerID, msg)
 	}
 	return SetResponse{Success: success, RequestID: req.RequestID}
 }

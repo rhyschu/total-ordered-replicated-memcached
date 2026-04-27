@@ -16,6 +16,8 @@ import (
 
 type Result struct {
 	ReqType string
+	Key	    string
+	Value   string
 	Target  string
 	Success bool
 	Latency time.Duration
@@ -23,7 +25,7 @@ type Result struct {
 
 func main() {
 
-	targetsGroup := flag.String("targets", "localhost:8001,localhost:8002,localhost:8003", "Server addresses, separated by commas")
+	targetsGroup := flag.String("targets", "localhost:8001,localhost:8002,localhost:8003", "Server addresses")
 	targets := strings.Split(*targetsGroup, ",")
 	ratio := flag.Float64("ratio", 0.1, "Probability of a SET")
 	userCount := flag.Int("user_count", 10, "Number of users")
@@ -33,22 +35,29 @@ func main() {
 
 	fmt.Println("...Pre-populating database...")
 	for i := 0; i < 100; i++ {
-		executeReq(targets[0], "SET", fmt.Sprintf("key_%d", i), fmt.Sprintf("value_%d", i), "pre-populate", 0)
+		prePopulate(targets[0], fmt.Sprintf("key_%d", i), fmt.Sprintf("value_%d", i))
 	}
 
 	fmt.Printf("...Starting simulation for %d users...\n", *userCount)
 	results := make(chan Result, 100000)
 	var wg sync.WaitGroup
-	start := time.Now()
-	stop := time.After(*duration)
+	stop := make(chan struct{})
 
 	for i := 0; i < *userCount; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
 			clientID := fmt.Sprintf("client_%d", id)
+			target := targets[id%len(targets)]
+			conn, err := net.DialTimeout("tcp", target, 5*time.Second)
+			if err != nil {
+				fmt.Printf("User %d failed to connect to %s; error: %v\n", id, target, err)
+				return
+			}
+			defer conn.Close()
+			encoder := gob.NewEncoder(conn)
+			decoder := gob.NewDecoder(conn)
 			var reqID int64 = 0
-			target := targets[id % len(targets)] 
 			for {
 				select {
 				case <-stop:
@@ -56,21 +65,22 @@ func main() {
 				default:
 					reqID++
 					key := fmt.Sprintf("key_%d", rand.Intn(100))
-					var reqType string
-					var val string
-					if rand.Float64() >= *ratio {
-						reqType = "GET"
-						val = ""
-					} else {
+					reqType := "GET"
+					val := ""
+					if rand.Float64() < *ratio {
 						reqType = "SET"
-						val = fmt.Sprintf("value_%d", rand.Intn(10000)) 
+						val = fmt.Sprintf("value_%d", rand.Intn(10000))
 					}
-					result := executeReq(target, reqType, key, val, clientID, reqID)
-					results <- result
+					res := execute(encoder, decoder, target, reqType, key, val, clientID, reqID)
+					results <- res
 				}
 			}
 		}(i)
 	}
+
+	time.AfterFunc(*duration, func() {
+		close(stop)
+	})
 
 	go func() {
 		wg.Wait()
@@ -78,47 +88,52 @@ func main() {
 	}()
 
 	saveResults(*output, results)
-	fmt.Printf("---Done, total time: %v---\n", time.Since(start))
+	fmt.Println("--- Done ---")
 
 }
 
-func executeReq(target string, reqType string, key string, value string, clientID string, reqID int64) Result {
+func execute(enc *gob.Encoder, dec *gob.Decoder, target, reqType, key, value, clientID string, reqID int64) Result {
 	start := time.Now()
-	conn, err := net.DialTimeout("tcp", target, 5*time.Second)
-	if err != nil {
-		return Result{reqType, target, false, time.Since(start)}
-	}
-	defer conn.Close()
-	encoder := gob.NewEncoder(conn)
-	decoder := gob.NewDecoder(conn)
 	var packetOut multicast.Packet
 	if reqType == "GET" {
 		packetOut = multicast.Packet{MsgType: multicast.ClientGetRequest, Msg: multicast.GetRequest{Key: key, ClientID: clientID, RequestID: reqID}}
 	} else {
 		packetOut = multicast.Packet{MsgType: multicast.ClientSetRequest, Msg: multicast.SetRequest{Key: key, Value: value, ClientID: clientID, RequestID: reqID}}
 	}
-	err := encoder.Encode(packetOut)
-	if err != nil {
-		return Result{reqType, target, false, time.Since(start)}
+	if err := enc.Encode(packetOut); err != nil {
+		return Result{reqType, key, value, target, false, time.Since(start)}
 	}
 	var packetIn multicast.Packet
-	err := decoder.Decode(&packetIn)
-	if err != nil {
-		return Result{reqType, target, false, time.Since(start)}
+	if err := dec.Decode(&packetIn); err != nil {
+		return Result{reqType, key, value, target, false, time.Since(start)}
 	}
 	success := false
+	getValue := value
 	if reqType == "SET" {
-		msg, ok := packetIn.Msg.(multicast.SetResponse)
-		if ok {
+		if msg, ok := packetIn.Msg.(multicast.SetResponse); ok {
 			success = msg.Success
 		}
 	} else {
-		msg, ok := packetIn.Msg.(multicast.GetResponse)
-		if ok {
+		if msg, ok := packetIn.Msg.(multicast.GetResponse); ok {
 			success = msg.Success
+			getValue = msg.Value
 		}
 	}
-	return Result{reqType, target, success, time.Since(start)}
+	return Result{reqType, key, getValue, target, success, time.Since(start)}
+}
+
+func prePopulate(target, key, value string) {
+	conn, err := net.Dial("tcp", target)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	enc := gob.NewEncoder(conn)
+	pac := multicast.Packet{
+		MsgType: multicast.ClientSetRequest, 
+		Msg: multicast.SetRequest{Key: key, Value: value, ClientID: "pre", RequestID: 0},
+	}
+	enc.Encode(pac)
 }
 
 func saveResults(fileLocation string, results <-chan Result) {
@@ -129,8 +144,8 @@ func saveResults(fileLocation string, results <-chan Result) {
 	defer file.Close()
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
-	writer.Write([]string{"ReqType", "Target", "Success", "Latency_us"})
+	writer.Write([]string{"ReqType", "Key", "Value", "Target", "Success", "Latency_us"})
 	for result := range results {
-		writer.Write([]string{result.ReqType, result.Target, fmt.Sprintf("%t", result.Success), fmt.Sprintf("%d", result.Latency.Microseconds())})
+		writer.Write([]string{result.ReqType, result.Key, result.Value, result.Target, fmt.Sprintf("%t", result.Success), fmt.Sprintf("%d", result.Latency.Microseconds())})
 	}
 }

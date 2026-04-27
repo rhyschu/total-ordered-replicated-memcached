@@ -21,7 +21,7 @@ func main() {
 	peersGroup := flag.String("peers", "", "Peers port, separated by commas")
 	peers := strings.Split(*peersGroup, ",")
 	consistent := flag.Bool("consistent", true, "Use consistent protocol?")
-	isSequencer := flag.Bool("sequencer", false, "Is the sequencer?")
+	isSequencer := flag.Bool("sequencer", false, "Is this the initial sequencer?")
 	batchSize := flag.Int("batch", 1, "Batch size")
 	latency := flag.Duration("artificial_latency", 0, "Artificial network latency")
 	flag.Parse()
@@ -58,8 +58,7 @@ func main() {
 		}
 		defer conn.Close()
 		encoder := gob.NewEncoder(conn)
-		err := encoder.Encode(pac)
-		if err != nil {
+		if encoder.Encode(pac) != nil {
 			log.Printf("Failed to encode packet to peer %d: %v", targetID, err)
 		}
 	}
