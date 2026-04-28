@@ -40,3 +40,7 @@ func (p *Inconsistent) HandleServerMsg(pac Packet) error {
 	}
 	return nil
 }
+
+func (p *Inconsistent) InitElection() {
+	return
+}

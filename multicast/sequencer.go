@@ -25,13 +25,13 @@ func (s *Sequencer) AddSet(req SetRequest) {
 	defer s.Mutex.Unlock()
 	s.Batch = append(s.Batch, req)
 	if len(s.Batch) >= s.BatchSize {
-		s.triggerMulticast()
+		s.TriggerMulticast()
 	} else if len(s.Batch) == 1 {
-		s.resetTimer()
+		s.ResetTimer()
 	}
 }
 
-func (s *Sequencer) triggerMulticast() {
+func (s *Sequencer) TriggerMulticast() {
 	if len(s.Batch) == 0 {
 		return
 	}
@@ -44,14 +44,14 @@ func (s *Sequencer) triggerMulticast() {
 	s.MulticastChan <- msg
 }
 
-func (s *Sequencer) resetTimer() {
+func (s *Sequencer) ResetTimer() {
 	if s.Timer != nil {
 		s.Timer.Stop()
 	}
 	s.Timer = time.AfterFunc(s.Timeout, func() {
 		s.Mutex.Lock()
 		defer s.Mutex.Unlock()
-		s.triggerMulticast()
+		s.TriggerMulticast()
 	})
 }
 

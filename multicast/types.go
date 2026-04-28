@@ -15,6 +15,9 @@ const (
 	ServerTOMulticast
 	ServerRIQuery
 	ServerRIResponse
+	ServerReformationInvite
+	ServerReformationResponse
+	ServerSequencerAnnouncement
 )
 
 type GetRequest struct {
@@ -53,12 +56,25 @@ type TOMulticast struct {
 
 type RIQuery struct {
 	RequestID int64
-	NodeID    int
+	SourceID  int
 }
 
 type RIResponse struct {
 	LastSequence int64
 	RequestID    int64
+}
+
+type ReformationInvite struct {
+	SourceID int
+}
+
+type ReformationResponse struct {
+	SourceID       int
+	HighestApplied int64
+}
+
+type SequencerAnnouncement struct {
+	SequencerID int
 }
 
 type Packet struct {
@@ -75,10 +91,14 @@ func init() {
 	gob.Register(TOMulticast{})
 	gob.Register(RIQuery{})
 	gob.Register(RIResponse{})
+	gob.Register(ReformationInvite{})
+	gob.Register(ReformationResponse{})
+	gob.Register(SequencerAnnouncement{})
 }
 
 type ConsistencyProtocol interface {
 	HandleClientGet(req GetRequest) GetResponse
 	HandleClientSet(req SetRequest) SetResponse
 	HandleServerMsg(pac Packet) error
+	InitElection()
 }

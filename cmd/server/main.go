@@ -10,7 +10,7 @@ import (
 	"encoding/gob"
 	"net"
 	"io"
-	"log"
+	"math/rand"
 )
 
 func main() {
@@ -20,15 +20,17 @@ func main() {
 	mcID := flag.String("mc", "21211", "Memcached ID")
 	peersGroup := flag.String("peers", "", "Peers port, separated by commas")
 	peers := strings.Split(*peersGroup, ",")
-	consistent := flag.Bool("consistent", true, "Use consistent protocol?")
-	isSequencer := flag.Bool("sequencer", false, "Is this the initial sequencer?")
-	batchSize := flag.Int("batch", 1, "Batch size")
-	latency := flag.Duration("artificial_latency", 0, "Artificial network latency")
+	consistent := flag.Bool("consistent", true, "Use consistent protocol? (default: true)")
+	isSequencer := flag.Bool("sequencer", false, "Is this the initial sequencer? (default: false)")
+	batchSize := flag.Int("batch", 1, "Batch size (default: 1)")
+	slow := flag.Bool("slow", false, "Is this an intentionally slow server? (default: false)")
 	flag.Parse()
 
 	mcAddress := fmt.Sprintf("127.0.0.1:%s", *mcID)
 	mcClient, err := memcached.NewClient(mcAddress)
 	fmt.Printf("---Server %d connected to memcached %s---\n", *id, mcAddress)
+
+	var protocol multicast.ConsistencyProtocol
 
 	peerMap := make(map[int]string)
 	curr := 0
@@ -43,49 +45,49 @@ func main() {
 	}
 
 	sendFunc := func(targetID int, pac multicast.Packet) {
-		if *latency > 0 {
-			time.Sleep(*latency)
+		if *slow {
+			time.Sleep(5*time.Millisecond + time.Duration(rand.Float64()*float64(10*time.Millisecond)))
 		}
 		address, ok := peerMap[targetID]
 		if !ok {
-			log.Printf("Unknown target ID %d", targetID)
+			fmt.Printf("Unknown target ID %d", targetID)
 			return
 		}
 		conn, err := net.DialTimeout("tcp", address, 5*time.Second)
 		if err != nil {
-			log.Printf("Failed to connect to peer %d at %s: %v", targetID, address, err)
+			fmt.Printf("Failed to connect to peer %d; error: %v", targetID, err)
+			if *consistent {
+				go protocol.InitElection()
+			}
 			return
 		}
 		defer conn.Close()
 		encoder := gob.NewEncoder(conn)
 		if encoder.Encode(pac) != nil {
-			log.Printf("Failed to encode packet to peer %d: %v", targetID, err)
+			fmt.Printf("Failed to encode packet to peer %d; error: %v", targetID, err)
 		}
 	}
 
-	var protocol multicast.ConsistencyProtocol
 	peerIDs := make([]int, 0, len(peerMap))
 	for pid := range peerMap {
 		peerIDs = append(peerIDs, pid)
 	}
 	if *consistent {
 		protocol = multicast.NewConsistent(mcClient, *id, peerIDs, sendFunc, *isSequencer, *batchSize)
-		fmt.Printf("Server %d running in CONSISTENT mode (Sequencer: %t)\n", *id, *isSequencer)
 	} else {
 		protocol = multicast.NewInconsistent(mcClient, *id, peerIDs, sendFunc)
-		fmt.Printf("Server %d running in INCONSISTENT mode\n", *id)
 	}
 
 	listener, err := net.Listen("tcp", ":"+*port)
 	if err != nil {
-		log.Fatalf("Failed to listen on port %s: %v", *port, err)
+		fmt.Printf("Failed to connect to port %s; error: %v", *port, err)
 	}
 	defer listener.Close()
-	fmt.Printf("Server %d listening on port %s...\n", *id, *port)
+	fmt.Printf("Server %d is connected to port %s...\n", *id, *port)
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Printf("Accept error: %v", err)
+			fmt.Printf("Accept error: %v", err)
 			continue
 		}
 		go handleConnection(conn, protocol)
@@ -102,7 +104,7 @@ func handleConnection(conn net.Conn, protocol multicast.ConsistencyProtocol) {
 		err := decoder.Decode(&pac)
 		if err != nil {
 			if err != io.EOF {
-				log.Printf("Decode error: %v", err)
+				fmt.Printf("Decode error: %v", err)
 			}
 			return
 		}
@@ -118,7 +120,7 @@ func handleConnection(conn net.Conn, protocol multicast.ConsistencyProtocol) {
 		default:
 			err := protocol.HandleServerMsg(pac)
 			if err != nil {
-				log.Printf("Protocol error handling server msg: %v", err)
+				fmt.Printf("Server message error: %v", err)
 			}
 		}
 	}

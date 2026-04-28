@@ -25,38 +25,40 @@ type Result struct {
 
 func main() {
 
-	targetsGroup := flag.String("targets", "localhost:8001,localhost:8002,localhost:8003", "Server addresses")
+	targetsGroup := flag.String("targets", "localhost:8001,localhost:8002,localhost:8003", "Server addresses, separated by commas")
 	targets := strings.Split(*targetsGroup, ",")
-	ratio := flag.Float64("ratio", 0.1, "Probability of a SET")
-	userCount := flag.Int("user_count", 10, "Number of users")
-	duration := flag.Duration("duration", 60*time.Second, "Simulation duration")
-	output := flag.String("output", "results.csv", "Output csv location")
+	ratio := flag.Float64("ratio", 0.1, "Probability of a SET (default: 0.1)")
+	databaseSize := flag.Int("database", 100, "Database size (default: 100)")
+	userCount := flag.Int("user", 10, "Number of users (default: 10)")
+	duration := flag.Duration("duration", 10*time.Second, "Simulation duration (default: 10s)")
+	output := flag.String("output", "csvs/results.csv", "Output csv location")
 	flag.Parse()
 
 	fmt.Println("...Pre-populating database...")
-	for i := 0; i < 100; i++ {
+	for i := 0; i < *databaseSize; i++ {
 		prePopulate(targets[0], fmt.Sprintf("key_%d", i), fmt.Sprintf("value_%d", i))
 	}
 
-	fmt.Printf("...Starting simulation for %d users...\n", *userCount)
+	fmt.Println("...Starting simulation...")
 	results := make(chan Result, 100000)
-	var wg sync.WaitGroup
+	var waitGroup sync.WaitGroup
 	stop := make(chan struct{})
 
 	for i := 0; i < *userCount; i++ {
-		wg.Add(1)
+		waitGroup.Add(1)
 		go func(id int) {
-			defer wg.Done()
+			defer waitGroup.Done()
 			clientID := fmt.Sprintf("client_%d", id)
-			target := targets[id%len(targets)]
-			conn, err := net.DialTimeout("tcp", target, 5*time.Second)
-			if err != nil {
-				fmt.Printf("User %d failed to connect to %s; error: %v\n", id, target, err)
-				return
-			}
-			defer conn.Close()
-			encoder := gob.NewEncoder(conn)
-			decoder := gob.NewDecoder(conn)
+			firstTarget := targets[id % len(targets)]
+			secondTarget := targets[(id + 1) % len(targets)]
+			fConn, _ := net.Dial("tcp", firstTarget)
+			sConn, _ := net.Dial("tcp", secondTarget)
+			defer fConn.Close()
+			defer sConn.Close()
+			fEnc := gob.NewEncoder(fConn)
+			fDec := gob.NewDecoder(fConn)
+			sEnc := gob.NewEncoder(sConn)
+			sDec := gob.NewDecoder(sConn)
 			var reqID int64 = 0
 			for {
 				select {
@@ -64,15 +66,29 @@ func main() {
 					return
 				default:
 					reqID++
-					key := fmt.Sprintf("key_%d", rand.Intn(100))
+					key := fmt.Sprintf("key_%d", rand.Intn(*databaseSize))
 					reqType := "GET"
 					val := ""
+					hedge := 5*time.Millisecond
 					if rand.Float64() < *ratio {
 						reqType = "SET"
 						val = fmt.Sprintf("value_%d", rand.Intn(10000))
+						hedge = 100*time.Millisecond
 					}
-					res := execute(encoder, decoder, target, reqType, key, val, clientID, reqID)
-					results <- res
+					resultChan := make(chan Result, 2)
+					go func() {
+						resultChan <- execute(fEnc, fDec, firstTarget, reqType, key, val, clientID, reqID)
+					}()
+					var result Result
+					select {
+					case result = <-resultChan:
+					case <-time.After(hedge):
+						go func() {
+							resultChan <- execute(sEnc, sDec, secondTarget, reqType, key, val, clientID, reqID)
+						}()
+						result = <-resultChan
+					}
+					results <- result
 				}
 			}
 		}(i)
@@ -83,7 +99,7 @@ func main() {
 	})
 
 	go func() {
-		wg.Wait()
+		waitGroup.Wait()
 		close(results)
 	}()
 

@@ -2,30 +2,33 @@ package multicast
 
 import (
 	"total-ordered-replicated-memcached/memcached"
-	"time"
 	"fmt"
+	"time"
 	"sync"
 	"sync/atomic"
 )
 
 type Consistent struct {
-	mc             *memcached.Client
-	ID             int
-	Peers          []int
-	SendFunc       func(targetID int, pac Packet)
-	IsSequencer    bool
-	Sequencer      *Sequencer
-	HighestApplied int64
-	Mutex          sync.Mutex
-	Cond           *sync.Cond
-	PendingMsgs    map[int64]TOMulticast
-	RIMap          sync.Map
-	RICounter      int64
-	SetMap         sync.Map
+	mc                *memcached.Client
+	ID                int
+	Peers             []int
+	SendFunc          func(targetID int, pac Packet)
+	IsSequencer       bool
+	Sequencer         *Sequencer
+	HighestApplied    int64
+	Mutex             sync.Mutex
+	Cond              *sync.Cond
+	PendingMsgs       map[int64]TOMulticast
+	RIMap             sync.Map
+	RICounter         int64
+	SetMap            sync.Map
+	Election          bool
+	MutexElection     sync.Mutex
+	ElectionResponses map[int]int64
 }
 
 func NewConsistent(mc *memcached.Client, id int, peers []int, sendFunc func(int, Packet), isSequencer bool, batchSize int) *Consistent {
-	c := &Consistent{mc: mc, ID: id, Peers: peers, SendFunc: sendFunc, IsSequencer: isSequencer, PendingMsgs: make(map[int64]TOMulticast)}
+	c := &Consistent{mc: mc, ID: id, Peers: peers, SendFunc: sendFunc, IsSequencer: isSequencer, PendingMsgs: make(map[int64]TOMulticast), ElectionResponses: make(map[int]int64)}
 	c.Cond = sync.NewCond(&c.Mutex)
 	if isSequencer {
 		c.Sequencer = NewSequencer(batchSize, 100*time.Millisecond)
@@ -45,6 +48,11 @@ func (p *Consistent) RunSequencer() {
 }
 
 func (p *Consistent) HandleClientGet(req GetRequest) GetResponse {
+	p.MutexElection.Lock()
+    for p.Election {
+        p.Cond.Wait()
+    }
+    p.MutexElection.Unlock()
 	var readIndex int64
 	if p.IsSequencer {
 		readIndex = p.Sequencer.GetCurrentSeq()
@@ -52,7 +60,7 @@ func (p *Consistent) HandleClientGet(req GetRequest) GetResponse {
 		riID := atomic.AddInt64(&p.RICounter, 1)
 		ch := make(chan int64, 1)
 		p.RIMap.Store(riID, ch)
-		p.SendFunc(1, Packet{MsgType: ServerRIQuery, Msg: RIQuery{RequestID: riID, NodeID: p.ID}})
+		p.SendFunc(1, Packet{MsgType: ServerRIQuery, Msg: RIQuery{RequestID: riID, SourceID: p.ID}})
 		select {
 		case readIndex = <-ch:
 		case <-time.After(5*time.Second):
@@ -70,6 +78,11 @@ func (p *Consistent) HandleClientGet(req GetRequest) GetResponse {
 }
 
 func (p *Consistent) HandleClientSet(req SetRequest) SetResponse {
+	p.MutexElection.Lock()
+    for p.Election {
+        p.Cond.Wait()
+    }
+    p.MutexElection.Unlock()
 	done := make(chan bool, 1)
 	key := fmt.Sprintf("%s_%d", req.ClientID, req.RequestID)
 	p.SetMap.Store(key, done)
@@ -123,7 +136,7 @@ func (p *Consistent) HandleServerMsg(pac Packet) error {
 	case ServerRIQuery:
 		if p.IsSequencer {
 			msg := pac.Msg.(RIQuery)
-			p.SendFunc(msg.NodeID, Packet{MsgType: ServerRIResponse, Msg: RIResponse{LastSequence: p.Sequencer.GetCurrentSeq(), RequestID: msg.RequestID}})
+			p.SendFunc(msg.SourceID, Packet{MsgType: ServerRIResponse, Msg: RIResponse{LastSequence: p.Sequencer.GetCurrentSeq(), RequestID: msg.RequestID}})
 		}
 	case ServerRIResponse:
 		msg := pac.Msg.(RIResponse)
@@ -131,8 +144,53 @@ func (p *Consistent) HandleServerMsg(pac Packet) error {
 		if ok {
 			ch.(chan int64) <- msg.LastSequence
 		}
+	case ServerReformationInvite:
+        p.Mutex.Lock()
+        p.Election = true
+        p.Mutex.Unlock()
+        msg := pac.Msg.(ReformationInvite)
+        p.SendFunc(msg.SourceID, Packet{MsgType: ServerReformationResponse, Msg: ReformationResponse{SourceID: p.ID, HighestApplied: p.HighestApplied}})
+    case ServerReformationResponse:
+        p.Mutex.Lock()
+		msg := pac.Msg.(ReformationResponse)
+        p.ElectionResponses[msg.SourceID] = msg.HighestApplied
+        if len(p.ElectionResponses) == len(p.Peers) { 
+            maxID := p.ID
+            maxApplied := p.HighestApplied
+            for peerID, applied := range p.ElectionResponses {
+                if applied > maxApplied {
+                    maxID = peerID
+                    maxApplied = applied
+                }
+            }
+			for _, peerID := range p.Peers {
+				go p.SendFunc(peerID, Packet{MsgType: ServerSequencerAnnouncement, Msg: SequencerAnnouncement{SequencerID: maxID}})
+			}
+        }
+        p.Mutex.Unlock()
+    case ServerSequencerAnnouncement:
+        p.Mutex.Lock()
+		p.Election = false
+		msg := pac.Msg.(SequencerAnnouncement)
+		if (msg.SequencerID == p.ID) && p.Sequencer == nil {
+            p.Sequencer = NewSequencer(1, 100*time.Millisecond)
+            p.Sequencer.CurrentSeq = p.HighestApplied
+            go p.RunSequencer()
+        }
+        fmt.Printf("New Sequencer %d is running\n", msg.SequencerID)
+        p.Mutex.Unlock()
 	default:
 		return fmt.Errorf("invalid message type: %v", pac.MsgType)
 	}
 	return nil
+}
+
+func (p *Consistent) InitElection() {
+	p.Mutex.Lock()
+    p.Election = true
+    p.ElectionResponses[p.ID] = p.HighestApplied
+    p.Mutex.Unlock()
+	for _, peerID := range p.Peers {
+        go p.SendFunc(peerID, Packet{MsgType: ServerReformationInvite, Msg: ReformationInvite{SourceID: p.ID}})
+    }
 }
