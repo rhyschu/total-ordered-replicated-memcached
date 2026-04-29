@@ -1,3 +1,4 @@
+// server main.go
 package main
 
 import (
@@ -18,15 +19,15 @@ func main() {
 	id := flag.Int("id", 1, "Server ID")
 	port := flag.String("port", "8001", "Port")
 	mcID := flag.String("mc", "21211", "Memcached ID")
-	peersGroup := flag.String("peers", "", "Peers port, separated by commas")
-	peers := strings.Split(*peersGroup, ",")
+	peersGroup := flag.String("peers", "", "Peers port, preceded by ':' and separated by ',")
 	consistent := flag.Bool("consistent", true, "Use consistent protocol? (default: true)")
 	isSequencer := flag.Bool("sequencer", false, "Is this the initial sequencer? (default: false)")
 	batchSize := flag.Int("batch", 1, "Batch size (default: 1)")
 	slow := flag.Bool("slow", false, "Is this an intentionally slow server? (default: false)")
 	flag.Parse()
+	peers := strings.Split(*peersGroup, ",")
 
-	mcAddress := fmt.Sprintf("127.0.0.1:%s", *mcID)
+	mcAddress := fmt.Sprintf("localhost:%s", *mcID)
 	mcClient, err := memcached.NewClient(mcAddress)
 	fmt.Printf("---Server %d connected to memcached %s---\n", *id, mcAddress)
 
@@ -50,12 +51,12 @@ func main() {
 		}
 		address, ok := peerMap[targetID]
 		if !ok {
-			fmt.Printf("Unknown target ID %d", targetID)
+			fmt.Printf("Unknown target ID %d\n", targetID)
 			return
 		}
 		conn, err := net.DialTimeout("tcp", address, 5*time.Second)
 		if err != nil {
-			fmt.Printf("Failed to connect to peer %d; error: %v", targetID, err)
+			fmt.Printf("Failed to connect to peer %d\n", targetID)
 			if *consistent {
 				go protocol.InitElection()
 			}
@@ -64,7 +65,7 @@ func main() {
 		defer conn.Close()
 		encoder := gob.NewEncoder(conn)
 		if encoder.Encode(pac) != nil {
-			fmt.Printf("Failed to encode packet to peer %d; error: %v", targetID, err)
+			fmt.Printf("Failed to encode packet to peer %d\n", targetID)
 		}
 	}
 
@@ -72,6 +73,7 @@ func main() {
 	for pid := range peerMap {
 		peerIDs = append(peerIDs, pid)
 	}
+	
 	if *consistent {
 		protocol = multicast.NewConsistent(mcClient, *id, peerIDs, sendFunc, *isSequencer, *batchSize)
 	} else {
@@ -80,14 +82,14 @@ func main() {
 
 	listener, err := net.Listen("tcp", ":"+*port)
 	if err != nil {
-		fmt.Printf("Failed to connect to port %s; error: %v", *port, err)
+		fmt.Printf("Failed to connect to port %s\n", *port)
 	}
 	defer listener.Close()
-	fmt.Printf("Server %d is connected to port %s...\n", *id, *port)
+	fmt.Printf("---Server %d is connected to port %s---\n", *id, *port)
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			fmt.Printf("Accept error: %v", err)
+			fmt.Printf("Accept error: %v\n", err)
 			continue
 		}
 		go handleConnection(conn, protocol)
@@ -104,7 +106,7 @@ func handleConnection(conn net.Conn, protocol multicast.ConsistencyProtocol) {
 		err := decoder.Decode(&pac)
 		if err != nil {
 			if err != io.EOF {
-				fmt.Printf("Decode error: %v", err)
+				fmt.Printf("Decode error: %v\n", err)
 			}
 			return
 		}
@@ -120,7 +122,7 @@ func handleConnection(conn net.Conn, protocol multicast.ConsistencyProtocol) {
 		default:
 			err := protocol.HandleServerMsg(pac)
 			if err != nil {
-				fmt.Printf("Server message error: %v", err)
+				fmt.Printf("Server message error: %v\n", err)
 			}
 		}
 	}

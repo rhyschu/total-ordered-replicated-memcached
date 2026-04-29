@@ -1,3 +1,4 @@
+// consistent.go
 package multicast
 
 import (
@@ -23,7 +24,6 @@ type Consistent struct {
 	RICounter         int64
 	SetMap            sync.Map
 	Election          bool
-	MutexElection     sync.Mutex
 	ElectionResponses map[int]int64
 }
 
@@ -42,17 +42,17 @@ func (p *Consistent) RunSequencer() {
 		pac := Packet{MsgType: ServerTOMulticast, Msg: msg}
 		p.HandleServerMsg(pac)
 		for _, peerID := range p.Peers {
-			p.SendFunc(peerID, pac)
+			go p.SendFunc(peerID, pac)
 		}
 	}
 }
 
 func (p *Consistent) HandleClientGet(req GetRequest) GetResponse {
-	p.MutexElection.Lock()
+	p.Mutex.Lock()
     for p.Election {
         p.Cond.Wait()
     }
-    p.MutexElection.Unlock()
+    p.Mutex.Unlock()
 	var readIndex int64
 	if p.IsSequencer {
 		readIndex = p.Sequencer.GetCurrentSeq()
@@ -78,11 +78,11 @@ func (p *Consistent) HandleClientGet(req GetRequest) GetResponse {
 }
 
 func (p *Consistent) HandleClientSet(req SetRequest) SetResponse {
-	p.MutexElection.Lock()
+	p.Mutex.Lock()
     for p.Election {
         p.Cond.Wait()
     }
-    p.MutexElection.Unlock()
+    p.Mutex.Unlock()
 	done := make(chan bool, 1)
 	key := fmt.Sprintf("%s_%d", req.ClientID, req.RequestID)
 	p.SetMap.Store(key, done)

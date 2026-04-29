@@ -1,3 +1,4 @@
+// sequencer.go
 package multicast
 
 import (

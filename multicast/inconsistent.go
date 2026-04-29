@@ -1,3 +1,4 @@
+// inconsistent.go
 package multicast
 
 import (
@@ -42,5 +43,4 @@ func (p *Inconsistent) HandleServerMsg(pac Packet) error {
 }
 
 func (p *Inconsistent) InitElection() {
-	return
 }

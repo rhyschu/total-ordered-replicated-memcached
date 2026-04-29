@@ -1,3 +1,4 @@
+// client main.go
 package main
 
 import (
@@ -25,19 +26,23 @@ type Result struct {
 
 func main() {
 
-	targetsGroup := flag.String("targets", "localhost:8001,localhost:8002,localhost:8003", "Server addresses, separated by commas")
-	targets := strings.Split(*targetsGroup, ",")
+	targetsGroup := flag.String("targets", "localhost:8001,localhost:8002,localhost:8003,localhost:8004,localhost:8005", "Server addresses, separated by ','")
 	ratio := flag.Float64("ratio", 0.1, "Probability of a SET (default: 0.1)")
 	databaseSize := flag.Int("database", 100, "Database size (default: 100)")
-	userCount := flag.Int("user", 10, "Number of users (default: 10)")
+	userCount := flag.Int("user", 20, "Number of users (default: 20)")
 	duration := flag.Duration("duration", 10*time.Second, "Simulation duration (default: 10s)")
-	output := flag.String("output", "csvs/results.csv", "Output csv location")
+	output := flag.String("output", "data/csvs/results.csv", "Output csv location")
 	flag.Parse()
+	targets := strings.Split(*targetsGroup, ",")
 
 	fmt.Println("...Pre-populating database...")
-	for i := 0; i < *databaseSize; i++ {
-		prePopulate(targets[0], fmt.Sprintf("key_%d", i), fmt.Sprintf("value_%d", i))
-	}
+	conn, _ := net.Dial("tcp", targets[0])
+    defer conn.Close()
+    enc := gob.NewEncoder(conn)
+    for i := 0; i < *databaseSize; i++ {
+        pac := multicast.Packet{MsgType: multicast.ClientSetRequest, Msg: multicast.SetRequest{Key: fmt.Sprintf("key_%d", i), Value: fmt.Sprintf("value_%d", i), ClientID: "pre", RequestID: 0}}
+        enc.Encode(pac)
+    }
 
 	fmt.Println("...Starting simulation...")
 	results := make(chan Result, 100000)
@@ -104,7 +109,7 @@ func main() {
 	}()
 
 	saveResults(*output, results)
-	fmt.Println("--- Done ---")
+	fmt.Println("---Done---")
 
 }
 

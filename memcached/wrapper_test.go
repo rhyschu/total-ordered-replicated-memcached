@@ -1,3 +1,4 @@
+// wrapper_test.go
 package memcached
 
 import (
