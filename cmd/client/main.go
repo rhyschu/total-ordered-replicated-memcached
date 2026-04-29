@@ -55,7 +55,10 @@ func main() {
 			defer waitGroup.Done()
 			clientID := fmt.Sprintf("client_%d", id)
 			firstTarget := targets[id % len(targets)]
-			secondTarget := targets[(id + 1) % len(targets)]
+			secondTarget := firstTarget 
+			if len(targets) > 1 {
+				secondTarget = targets[(id + rand.Intn(len(targets) - 1) + 1) % len(targets)]
+			}
 			fConn, _ := net.Dial("tcp", firstTarget)
 			sConn, _ := net.Dial("tcp", secondTarget)
 			defer fConn.Close()
