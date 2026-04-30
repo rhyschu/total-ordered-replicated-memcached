@@ -10,7 +10,6 @@ import (
 	"strings"
 	"encoding/gob"
 	"net"
-	"io"
 	"math/rand"
 )
 
@@ -33,6 +32,7 @@ func main() {
 
 	var protocol multicast.ConsistencyProtocol
 
+	// map peer ID to address
 	peerMap := make(map[int]string)
 	curr := 0
 	for i := 1; i <= len(peers) + 1; i++ {
@@ -45,6 +45,7 @@ func main() {
 		}
 	}
 
+	// the actual send function used by the protocol to send messages
 	sendFunc := func(targetID int, pac multicast.Packet) {
 		if *slow {
 			time.Sleep(5*time.Millisecond + time.Duration(rand.Float64()*float64(10*time.Millisecond)))
@@ -105,9 +106,6 @@ func handleConnection(conn net.Conn, protocol multicast.ConsistencyProtocol) {
 		var pac multicast.Packet
 		err := decoder.Decode(&pac)
 		if err != nil {
-			if err != io.EOF {
-				fmt.Printf("Decode error: %v\n", err)
-			}
 			return
 		}
 		switch pac.MsgType {

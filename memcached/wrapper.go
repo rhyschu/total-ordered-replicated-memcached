@@ -1,4 +1,5 @@
 // wrapper.go
+// actual direct interaction with memcached instance
 package memcached
 
 import (

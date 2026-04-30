@@ -1,4 +1,5 @@
 // types.go
+// defines the message types, message structures, and the protocol interface
 package multicast
 
 import (

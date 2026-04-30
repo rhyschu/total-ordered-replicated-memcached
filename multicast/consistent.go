@@ -1,4 +1,5 @@
 // consistent.go
+// server actions upon receiving messages for consistent protocol
 package multicast
 
 import (
@@ -18,20 +19,20 @@ type Consistent struct {
 	Sequencer         *Sequencer
 	HighestApplied    int64
 	Mutex             sync.Mutex
-	Cond              *sync.Cond
+	Cond              *sync.Cond // conditionally wait on elections and applying messages
 	PendingMsgs       map[int64]TOMulticast
-	RIMap             sync.Map
-	RICounter         int64
-	SetMap            sync.Map
+	RIMap             sync.Map // maps RI request ID to channels
+	RICounter         int64 // unique, incrementing ID for RI requests
+	SetMap            sync.Map // maps clientID_requestID to channels
 	Election          bool
-	ElectionResponses map[int]int64
+	ElectionResponses map[int]int64 // maps peer ID to their response number
 }
 
 func NewConsistent(mc *memcached.Client, id int, peers []int, sendFunc func(int, Packet), isSequencer bool, batchSize int) *Consistent {
 	c := &Consistent{mc: mc, ID: id, Peers: peers, SendFunc: sendFunc, IsSequencer: isSequencer, PendingMsgs: make(map[int64]TOMulticast), ElectionResponses: make(map[int]int64)}
 	c.Cond = sync.NewCond(&c.Mutex)
 	if isSequencer {
-		c.Sequencer = NewSequencer(batchSize, 100*time.Millisecond)
+		c.Sequencer = NewSequencer(batchSize, 100*time.Millisecond) // subject to change
 		go c.RunSequencer()
 	}
 	return c
@@ -130,7 +131,7 @@ func (p *Consistent) HandleServerMsg(pac Packet) error {
 			}
 			p.HighestApplied = nextSeq
 			delete(p.PendingMsgs, nextSeq)
-			p.Cond.Broadcast()
+			p.Cond.Broadcast() // wake up any waiting handlers
 		}
 		p.Mutex.Unlock()
 	case ServerRIQuery:
@@ -173,7 +174,7 @@ func (p *Consistent) HandleServerMsg(pac Packet) error {
 		p.Election = false
 		msg := pac.Msg.(SequencerAnnouncement)
 		if (msg.SequencerID == p.ID) && p.Sequencer == nil {
-            p.Sequencer = NewSequencer(1, 100*time.Millisecond)
+            p.Sequencer = NewSequencer(1, 100*time.Millisecond) // subject to change
             p.Sequencer.CurrentSeq = p.HighestApplied
             go p.RunSequencer()
         }

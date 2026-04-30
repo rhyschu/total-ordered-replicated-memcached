@@ -26,12 +26,12 @@ type Result struct {
 
 func main() {
 
-	targetsGroup := flag.String("targets", "localhost:8001,localhost:8002,localhost:8003,localhost:8004,localhost:8005", "Server addresses, separated by ','")
+	targetsGroup := flag.String("targets", "localhost:8001,localhost:8002,localhost:8003", "Server addresses, separated by ','")
 	ratio := flag.Float64("ratio", 0.1, "Probability of a SET (default: 0.1)")
 	databaseSize := flag.Int("database", 100, "Database size (default: 100)")
 	userCount := flag.Int("user", 20, "Number of users (default: 20)")
 	duration := flag.Duration("duration", 10*time.Second, "Simulation duration (default: 10s)")
-	output := flag.String("output", "data/csvs/results.csv", "Output csv location")
+	output := flag.String("output", "data/csv/results.csv", "Output csv location")
 	flag.Parse()
 	targets := strings.Split(*targetsGroup, ",")
 
@@ -46,7 +46,7 @@ func main() {
 
 	fmt.Println("...Starting simulation...")
 	results := make(chan Result, 100000)
-	var waitGroup sync.WaitGroup
+	var waitGroup sync.WaitGroup // to wait for all user goroutines to finish before closing results channel
 	stop := make(chan struct{})
 
 	for i := 0; i < *userCount; i++ {
@@ -153,10 +153,7 @@ func prePopulate(target, key, value string) {
 	}
 	defer conn.Close()
 	enc := gob.NewEncoder(conn)
-	pac := multicast.Packet{
-		MsgType: multicast.ClientSetRequest, 
-		Msg: multicast.SetRequest{Key: key, Value: value, ClientID: "pre", RequestID: 0},
-	}
+	pac := multicast.Packet{MsgType: multicast.ClientSetRequest, Msg: multicast.SetRequest{Key: key, Value: value, ClientID: "pre", RequestID: 0}}
 	enc.Encode(pac)
 }
 

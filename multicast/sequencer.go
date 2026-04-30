@@ -1,4 +1,5 @@
 // sequencer.go
+// functions unique to the sequencer
 package multicast
 
 import (

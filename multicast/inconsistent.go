@@ -1,4 +1,5 @@
 // inconsistent.go
+// server actions upon receiving messages for inconsistent protocol
 package multicast
 
 import (
