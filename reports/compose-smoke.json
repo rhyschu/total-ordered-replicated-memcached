@@ -1,0 +1,10 @@
+{
+  "timestamp_utc": "2026-11-01T22:26:39Z",
+  "scope": "Docker Compose on one host; non-root rpcd, three persistent voters and real Memcached",
+  "leader_failover": true,
+  "committed_value_retained": true,
+  "cache_outage_read": true,
+  "all_nodes_restart_recovery": true,
+  "restart_idempotency_receipt": true,
+  "test_key_deleted": true
+}

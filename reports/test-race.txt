@@ -1,0 +1,7 @@
+?   	total-ordered-replicated-memcached/cmd/client	[no test files]
+?   	total-ordered-replicated-memcached/cmd/rpcctl	[no test files]
+?   	total-ordered-replicated-memcached/cmd/rpcd	[no test files]
+?   	total-ordered-replicated-memcached/cmd/server	[no test files]
+ok  	total-ordered-replicated-memcached/memcached	1.933s
+?   	total-ordered-replicated-memcached/multicast	[no test files]
+ok  	total-ordered-replicated-memcached/rpcache	23.750s

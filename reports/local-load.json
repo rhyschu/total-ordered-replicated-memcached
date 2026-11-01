@@ -1,0 +1,14 @@
+{
+  "arch": "amd64",
+  "clients": 20,
+  "elapsed_seconds": 2.7294926999999998,
+  "failures": 0,
+  "go": "go1.27.3",
+  "median_ms": 49.55,
+  "os": "windows",
+  "p95_ms": 92.728,
+  "requests": 1000,
+  "requests_per_second": 366.36844641496936,
+  "scope": "3 real TCP Raft nodes, persistent BoltDB, loopback HTTP RPC, 20 concurrent clients, 500 SET/GET pairs on separate per-client keys; no Memcached, TLS or WAN in timing; includes quorum commit and read barriers",
+  "timestamp_utc": "2026-11-01T22:24:54Z"
+}

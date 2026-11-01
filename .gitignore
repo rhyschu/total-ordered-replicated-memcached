@@ -1,0 +1,8 @@
+bin/
+data/
+*.exe
+*.test
+*.out
+.env
+coverage.txt
+certs/

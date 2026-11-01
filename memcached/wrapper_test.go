@@ -2,12 +2,16 @@
 package memcached
 
 import (
+	"os"
 	"testing"
 )
 
 func TestMemcachedWrapper(t *testing.T) {
-	address := "localhost:21211"
-	
+	address := os.Getenv("MEMCACHED_ADDR")
+	if address == "" {
+		t.Skip("set MEMCACHED_ADDR to run the external Memcached integration test")
+	}
+
 	client, err := NewClient(address)
 	if err != nil {
 		t.Fatalf("Failed to connect to memcached: %v", err)

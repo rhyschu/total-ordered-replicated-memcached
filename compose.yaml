@@ -1,0 +1,31 @@
+name: rpcache
+x-node: &node
+  build: .
+  restart: unless-stopped
+  environment:
+    RPCACHE_TOKEN: ${RPCACHE_TOKEN:?Set a random RPCACHE_TOKEN of at least 24 characters}
+  depends_on: [memcached]
+services:
+  memcached:
+    image: memcached:1.6.39-alpine
+    command: ["memcached", "-m", "64", "-U", "0"]
+    restart: unless-stopped
+  n1:
+    <<: *node
+    ports: ["127.0.0.1:8001:8001"]
+    volumes: ["n1:/data"]
+    command: ["-id=n1", "-raft=n1:9001", "-http=:8001", "-data=/data", "-bootstrap", "-memcached=memcached:11211", "-peers={\"n1\":\"n1:9001\",\"n2\":\"n2:9002\",\"n3\":\"n3:9003\"}"]
+  n2:
+    <<: *node
+    ports: ["127.0.0.1:8002:8002"]
+    volumes: ["n2:/data"]
+    command: ["-id=n2", "-raft=n2:9002", "-http=:8002", "-data=/data", "-memcached=memcached:11211", "-peers={\"n1\":\"n1:9001\",\"n2\":\"n2:9002\",\"n3\":\"n3:9003\"}"]
+  n3:
+    <<: *node
+    ports: ["127.0.0.1:8003:8003"]
+    volumes: ["n3:/data"]
+    command: ["-id=n3", "-raft=n3:9003", "-http=:8003", "-data=/data", "-memcached=memcached:11211", "-peers={\"n1\":\"n1:9001\",\"n2\":\"n2:9002\",\"n3\":\"n3:9003\"}"]
+volumes:
+  n1:
+  n2:
+  n3:
