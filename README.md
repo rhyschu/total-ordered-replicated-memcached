@@ -30,14 +30,14 @@ Requirements: Docker Desktop/Engine and Compose. Build/test without Docker requi
 
 Set a **random secret**, then start the three voters and an isolated Memcached service:
 
-```powershell
+```ps
 $env:RPCACHE_TOKEN = 'replace-with-a-random-secret-at-least-24-characters'
 docker compose up -d --build
 ```
 
 The RPC ports are published **only on loopback**: 8001, 8002, 8003. Raft and Memcached ports are private to the Compose network. Bootstrap runs only on n1; existing storage is reused after restart. Separate volumes keep each voter's logs and snapshots independent.
 
-```powershell
+```ps
 go run ./cmd/rpcctl -method Cache.Set -key example -value hello -id write-001
 go run ./cmd/rpcctl -method Cache.Get -key example -id read-001
 go run ./cmd/rpcctl -method Cache.Delete -key example -id delete-001
@@ -51,7 +51,7 @@ Do not add `--volumes` to shutdown unless intentionally destroying all stored st
 
 Direct development without containers:
 
-```powershell
+```ps
 $env:RPCACHE_TOKEN = 'replace-with-a-random-secret-at-least-24-characters'
 go run ./cmd/rpcd -id n1 -raft 127.0.0.1:9001 -http 127.0.0.1:8001 -data data/n1 -bootstrap
 ```
