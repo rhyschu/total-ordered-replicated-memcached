@@ -8,7 +8,8 @@ This report applies only to the single fixed-sequencer total-order multicast imp
 - `go test -race -count=1 -timeout=180s ./...`: passed. [Captured output](test-race.txt).
 - Server and client executable builds: passed.
 - `python scripts/verify_local.py`: passed using three separate compiled server processes, real TCP/HTTP and isolated durable stores. [Captured result](local-smoke.json).
-- Compose YAML: parsed and checked for three server services, three dedicated Memcached services and independent node volumes. This is a structural check, not a container runtime test.
+- Docker image build: passed on Docker Engine 29.9.3, using the non-root runtime image.
+- `python scripts/verify_compose.py`: passed with three server containers, three real Memcached containers and independent durable volumes. [Captured result](compose-smoke.json). The test checks cross-replica reads, unavailable-member rejection, member restart, cache outage fallback, all-server restart and durable retry receipts. Test containers were stopped and removed afterward; persistent volumes were retained.
 
 Functional coverage includes ordered delivery after a gap, duplicate/conflicting record rejection, durable state and retry receipts, fixed-membership restart validation, sequencer loss, replica outage and catch-up, full cluster process restart, read-after-write across replicas, 50 concurrent writes to a shared key, actual write batching, partial-batch timer flush, authenticated/framed peer traffic, malformed/oversized input, HTTP authentication/admission, TLS requests, optional-cache failure, and ambiguous-write client retries. The race detector covers exercised paths rather than proving the absence of every possible race.
 
@@ -31,9 +32,8 @@ Maximum-size values with JSON escaping pass an HTTP round trip, and a full 16-co
 
 These timings exclude TLS, external Memcached, Docker and WAN traffic. Separate tests cover TLS and an unavailable cache backend. This is a single-host development workload, not a production throughput promise, a universal latency improvement or a formal history-based linearizability proof. It must not be compared directly with measurements of a different algorithm or test workload. [Source hashes](source-hashes.json) identify the working-tree implementation measured and tested.
 
-## Not completed in this environment
+## External cache integration
 
-- Docker image build and the container smoke script were **not run**: the Docker engine was unavailable. Starting the installed Docker Desktop through elevated execution was not executed because automatic approval could not refresh its revoked login token. No approval safeguard was bypassed.
-- A real external Memcached service was unavailable, so `MEMCACHED_ADDR` was not set. The external-cache branch remains to be exercised with a running service; this run establishes durable fallback during cache connection failure, not measured cache reuse against an actual daemon.
+After Docker was restarted and its access check succeeded, the full race suite was rerun with `MEMCACHED_ADDR` pointing to a dedicated Memcached 1.6.39 container on a dynamically assigned loopback port. The external-cache test verifies that reads populate the actual daemon, that subsequent reads return the correct value, that deliberately corrupted cache bytes cannot override durable state, and that a later write does not return an old cached value. The temporary daemon was removed after testing. No cache latency improvement is claimed.
 
-The local three-process smoke test passed sequencer/replica outage rejection, recovery after member restart, recovery after all processes restart, stable retry receipts, and the command-line client. It does not replace container or external-Memcached integration verification.
+Container verification remains single-host. Multi-host partitions, WAN latency, long-duration soak tests and a formal linearizability checker were not exercised. Membership is static, and the fixed sequencer has no automatic failover.

@@ -3,6 +3,7 @@ package rpcache
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -326,6 +327,16 @@ func TestMemcachedOutageAndRealCache(t *testing.T) {
 			if r, e := n.Read("key", time.Second); e != nil || r.Value != "value" {
 				t.Fatal("real cache failure")
 			}
+		}
+		cacheKey := fmt.Sprintf("ordered:%x", sha256.Sum256([]byte("key\x00value")))
+		if item, e := n.Cache.Get(cacheKey); e != nil || string(item.Value) != "value" {
+			t.Fatal("real Memcached was not populated", e)
+		}
+		if e := n.Cache.Set(&memcache.Item{Key: cacheKey, Value: []byte("poisoned")}); e != nil {
+			t.Fatal(e)
+		}
+		if r, e := n.Read("key", time.Second); e != nil || r.Value != "value" {
+			t.Fatal("cache bytes overrode authoritative state", e)
 		}
 		set(t, n, "replace", "key", "replacement")
 		if r, e := n.Read("key", time.Second); e != nil || r.Value != "replacement" {

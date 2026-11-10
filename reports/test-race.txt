@@ -1,4 +1,4 @@
 ?   	total-ordered-replicated-memcached/cmd/client	[no test files]
 ?   	total-ordered-replicated-memcached/cmd/server	[no test files]
-ok  	total-ordered-replicated-memcached/multicast	1.783s
-ok  	total-ordered-replicated-memcached/rpcache	6.271s
+ok  	total-ordered-replicated-memcached/multicast	1.791s
+ok  	total-ordered-replicated-memcached/rpcache	6.045s

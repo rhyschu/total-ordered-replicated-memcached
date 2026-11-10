@@ -11,7 +11,7 @@
   "multicast/state_test.go": "ac0b5ca71965726d741506ece55a2da69db5f7fea1b8bdaa85fffabae6af4c98",
   "multicast/types.go": "f262027543515a59b0e6e1438221196adc5bcfd35eac8687732bbf3845b66e13",
   "rpcache/client.go": "bca1606c47b07ca84cabbe25349cf2419f86015ee97fd172c9af86255853df0d",
-  "rpcache/cluster_test.go": "af44b3c1148c81b24c9fb25af773b83be191d8777561838e148c39123422fd11",
+  "rpcache/cluster_test.go": "69a23d00c01d95b82154173807717b35cdcc22a4d128a881ceac465a5bb5d906",
   "rpcache/http.go": "f61225a5e69161cf1d50a8dc9daf696c6081713fc8e077854dbcbf1f4deed8cd",
   "rpcache/load_test.go": "d810a508a618f839dec8410bb13306f14ea981c067bb675d551a884b678a008d",
   "rpcache/node.go": "35bf2ec11d6e3ffef823e38ba250bf8d52a8c92d7e3b38d29dc9193ac60f3dd8"

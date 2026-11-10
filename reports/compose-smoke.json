@@ -1,0 +1,11 @@
+{
+  "timestamp_utc": "2026-11-10T01:58:46Z",
+  "scope": "single-host Docker Compose, fixed sequencer n1, all-member acknowledgments, three durable replicas and dedicated Memcached services",
+  "cross_replica_reads": true,
+  "missing_replica_fails_closed": true,
+  "replica_restart": true,
+  "memcached_outage_fallback": true,
+  "all_nodes_restart": true,
+  "durable_retry_receipt": true,
+  "test_key_deleted": true
+}
