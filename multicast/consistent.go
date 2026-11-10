@@ -1,197 +1,214 @@
-// consistent.go
-// server actions upon receiving messages for consistent protocol
 package multicast
 
 import (
-	"total-ordered-replicated-memcached/memcached"
+	"context"
+	"errors"
 	"fmt"
 	"time"
-	"sync"
-	"sync/atomic"
 )
 
+type PeerCall func(context.Context, string, Packet) (Packet, error)
 type Consistent struct {
-	mc                *memcached.Client
-	ID                int
-	Peers             []int
-	SendFunc          func(targetID int, pac Packet)
-	IsSequencer       bool
-	Sequencer         *Sequencer
-	HighestApplied    int64
-	Mutex             sync.Mutex
-	Cond              *sync.Cond // conditionally wait on elections and applying messages
-	PendingMsgs       map[int64]TOMulticast
-	RIMap             sync.Map // maps RI request ID to channels
-	RICounter         int64 // unique, incrementing ID for RI requests
-	SetMap            sync.Map // maps clientID_requestID to channels
-	Election          bool
-	ElectionResponses map[int]int64 // maps peer ID to their response number
+	ID, Sequencer  string
+	Peers          []string
+	State          *State
+	call           PeerCall
+	order          chan struct{}
+	queue          chan pendingWrite
+	batchSize      int
+	flush, timeout time.Duration
+	ctx            context.Context
+	cancel         context.CancelFunc
+	stopped        chan struct{}
 }
 
-func NewConsistent(mc *memcached.Client, id int, peers []int, sendFunc func(int, Packet), isSequencer bool, batchSize int) *Consistent {
-	c := &Consistent{mc: mc, ID: id, Peers: peers, SendFunc: sendFunc, IsSequencer: isSequencer, PendingMsgs: make(map[int64]TOMulticast), ElectionResponses: make(map[int]int64)}
-	c.Cond = sync.NewCond(&c.Mutex)
-	if isSequencer {
-		c.Sequencer = NewSequencer(batchSize, 100*time.Millisecond) // subject to change
-		go c.RunSequencer()
-	}
-	return c
-}
-
-func (p *Consistent) RunSequencer() {
-	for msg := range p.Sequencer.MulticastChan {
-		pac := Packet{MsgType: ServerTOMulticast, Msg: msg}
-		p.HandleServerMsg(pac)
-		for _, peerID := range p.Peers {
-			go p.SendFunc(peerID, pac)
-		}
-	}
-}
-
-func (p *Consistent) HandleClientGet(req GetRequest) GetResponse {
-	p.Mutex.Lock()
-    for p.Election {
-        p.Cond.Wait()
-    }
-    p.Mutex.Unlock()
-	var readIndex int64
-	if p.IsSequencer {
-		readIndex = p.Sequencer.GetCurrentSeq()
+func NewConsistent(id, sequencer string, peers []string, state *State, call PeerCall, batch int, flush, timeout time.Duration) *Consistent {
+	ctx, cancel := context.WithCancel(context.Background())
+	p := &Consistent{ID: id, Sequencer: sequencer, Peers: append([]string(nil), peers...), State: state, call: call, order: make(chan struct{}, 1), queue: make(chan pendingWrite, 128), batchSize: batch, flush: flush, timeout: timeout, ctx: ctx, cancel: cancel, stopped: make(chan struct{})}
+	if id == sequencer {
+		go p.runSequencer()
 	} else {
-		riID := atomic.AddInt64(&p.RICounter, 1)
-		ch := make(chan int64, 1)
-		p.RIMap.Store(riID, ch)
-		p.SendFunc(1, Packet{MsgType: ServerRIQuery, Msg: RIQuery{RequestID: riID, SourceID: p.ID}})
-		select {
-		case readIndex = <-ch:
-		case <-time.After(5*time.Second):
-			return GetResponse{Success: false, RequestID: req.RequestID}
-		}
-		p.RIMap.Delete(riID)
+		close(p.stopped)
 	}
-	p.Mutex.Lock()
-	for p.HighestApplied < readIndex {
-		p.Cond.Wait()
-	}
-	p.Mutex.Unlock()
-	value, success := p.mc.Get(req.Key)
-	return GetResponse{Value: value, Success: success, RequestID: req.RequestID}
+	return p
 }
-
-func (p *Consistent) HandleClientSet(req SetRequest) SetResponse {
-	p.Mutex.Lock()
-    for p.Election {
-        p.Cond.Wait()
-    }
-    p.Mutex.Unlock()
-	done := make(chan bool, 1)
-	key := fmt.Sprintf("%s_%d", req.ClientID, req.RequestID)
-	p.SetMap.Store(key, done)
-	if p.IsSequencer {
-		p.Sequencer.AddSet(req)
-	} else {
-		p.SendFunc(1, Packet{MsgType: ServerForwardSet, Msg: ForwardSet{Request: req, SourceID: p.ID}})
+func (p *Consistent) Close() { p.cancel(); <-p.stopped }
+func (p *Consistent) Write(ctx context.Context, c Command) (Result, error) {
+	if err := c.Validate(); err != nil {
+		return Result{}, err
 	}
-	success := false
+	if p.ID != p.Sequencer {
+		r, e := p.call(ctx, p.Sequencer, Packet{Kind: "submit", Command: &c})
+		if e != nil {
+			return Result{}, e
+		}
+		if r.Error != "" {
+			return Result{}, errors.New(r.Error)
+		}
+		return r.Result, nil
+	}
+	w := pendingWrite{command: c, ctx: ctx, done: make(chan writeResult, 1)}
 	select {
-	case success = <-done:
-	case <-time.After(5*time.Second):
-		success = false
+	case <-p.ctx.Done():
+		return Result{}, ErrUnavailable
+	case <-ctx.Done():
+		return Result{}, ctx.Err()
+	default:
 	}
-	p.SetMap.Delete(key)
-	return SetResponse{Success: success, RequestID: req.RequestID}
+	select {
+	case p.queue <- w:
+	default:
+		return Result{}, errors.New("sequencer queue is full")
+	}
+	select {
+	case r := <-w.done:
+		return r.result, r.err
+	case <-ctx.Done():
+		return Result{}, ctx.Err()
+	case <-p.ctx.Done():
+		return Result{}, ErrUnavailable
+	}
+}
+func (p *Consistent) Fence(ctx context.Context) (uint64, error) {
+	if p.ID != p.Sequencer {
+		r, e := p.call(ctx, p.Sequencer, Packet{Kind: "fence"})
+		if e != nil {
+			return 0, e
+		}
+		if r.Error != "" {
+			return 0, errors.New(r.Error)
+		}
+		return r.Sequence, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	select {
+	case p.order <- struct{}{}:
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-p.ctx.Done():
+		return 0, ErrUnavailable
+	}
+	defer func() { <-p.order }()
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if err := p.synchronize(ctx); err != nil {
+		return 0, err
+	}
+	seq, _, err := p.State.Position()
+	return seq, err
+}
+func (p *Consistent) Read(ctx context.Context, key string) (Result, error) {
+	seq, err := p.Fence(ctx)
+	if err != nil {
+		return Result{}, err
+	}
+	if err = p.State.Wait(ctx, seq); err != nil {
+		return Result{}, err
+	}
+	return p.State.Get(key)
 }
 
-func (p *Consistent) HandleServerMsg(pac Packet) error {
-	switch pac.MsgType {
-	case ServerForwardSet:
-		if p.IsSequencer {
-			p.Sequencer.AddSet(pac.Msg.(ForwardSet).Request)
-		}
-	case ServerTOMulticast:
-		msg := pac.Msg.(TOMulticast)
-		p.Mutex.Lock()
-		if msg.SequenceNumber <= p.HighestApplied {
-			p.Mutex.Unlock()
-			return nil
-		}
-		p.PendingMsgs[msg.SequenceNumber] = msg
-		for {
-			nextSeq := p.HighestApplied + 1
-			nextMsg, ok := p.PendingMsgs[nextSeq]
-			if !ok {
-				break
+// All configured replicas must acknowledge the ordered prefix. This deliberately
+// sacrifices availability on any replica failure; it is not quorum consensus.
+func (p *Consistent) synchronize(ctx context.Context) error {
+	seq, _, err := p.State.Position()
+	if err != nil {
+		return err
+	}
+	results := make(chan error, len(p.Peers))
+	for _, id := range p.Peers {
+		go func(id string) {
+			status, e := p.call(ctx, id, Packet{Kind: "status"})
+			if e != nil {
+				results <- e
+				return
 			}
-			for _, req := range nextMsg.Batch {
-				p.mc.Set(req.Key, req.Value)
-				key := fmt.Sprintf("%s_%d", req.ClientID, req.RequestID)
-				if ch, ok := p.SetMap.Load(key); ok {
-					ch.(chan bool) <- true
+			if status.Error != "" {
+				results <- errors.New(status.Error)
+				return
+			}
+			if status.Sequence > seq {
+				results <- errors.New("replica is ahead of fixed sequencer")
+				return
+			}
+			hash, e := p.State.HashAt(status.Sequence)
+			if e != nil || hash != status.Hash {
+				results <- errors.New("replica history conflicts with sequencer")
+				return
+			}
+			for index := status.Sequence + 1; index <= seq; index++ {
+				if e = ctx.Err(); e != nil {
+					results <- e
+					return
+				}
+				record, e := p.State.Record(index)
+				if e != nil {
+					results <- e
+					return
+				}
+				ack, e := p.call(ctx, id, Packet{Kind: "deliver", Record: &record})
+				if e != nil {
+					results <- e
+					return
+				}
+				if ack.Error != "" || ack.Sequence < index {
+					results <- fmt.Errorf("replica %s failed ordered delivery", id)
+					return
 				}
 			}
-			p.HighestApplied = nextSeq
-			delete(p.PendingMsgs, nextSeq)
-			p.Cond.Broadcast() // wake up any waiting handlers
-		}
-		p.Mutex.Unlock()
-	case ServerRIQuery:
-		if p.IsSequencer {
-			msg := pac.Msg.(RIQuery)
-			p.SendFunc(msg.SourceID, Packet{MsgType: ServerRIResponse, Msg: RIResponse{LastSequence: p.Sequencer.GetCurrentSeq(), RequestID: msg.RequestID}})
-		}
-	case ServerRIResponse:
-		msg := pac.Msg.(RIResponse)
-		ch, ok := p.RIMap.Load(msg.RequestID)
-		if ok {
-			ch.(chan int64) <- msg.LastSequence
-		}
-	case ServerReformationInvite:
-        p.Mutex.Lock()
-        p.Election = true
-        p.Mutex.Unlock()
-        msg := pac.Msg.(ReformationInvite)
-        p.SendFunc(msg.SourceID, Packet{MsgType: ServerReformationResponse, Msg: ReformationResponse{SourceID: p.ID, HighestApplied: p.HighestApplied}})
-    case ServerReformationResponse:
-        p.Mutex.Lock()
-		msg := pac.Msg.(ReformationResponse)
-        p.ElectionResponses[msg.SourceID] = msg.HighestApplied
-        if len(p.ElectionResponses) == len(p.Peers) { 
-            maxID := p.ID
-            maxApplied := p.HighestApplied
-            for peerID, applied := range p.ElectionResponses {
-                if applied > maxApplied {
-                    maxID = peerID
-                    maxApplied = applied
-                }
-            }
-			for _, peerID := range p.Peers {
-				go p.SendFunc(peerID, Packet{MsgType: ServerSequencerAnnouncement, Msg: SequencerAnnouncement{SequencerID: maxID}})
-			}
-        }
-        p.Mutex.Unlock()
-    case ServerSequencerAnnouncement:
-        p.Mutex.Lock()
-		p.Election = false
-		msg := pac.Msg.(SequencerAnnouncement)
-		if (msg.SequencerID == p.ID) && p.Sequencer == nil {
-            p.Sequencer = NewSequencer(1, 100*time.Millisecond) // subject to change
-            p.Sequencer.CurrentSeq = p.HighestApplied
-            go p.RunSequencer()
-        }
-        fmt.Printf("New Sequencer %d is running\n", msg.SequencerID)
-        p.Mutex.Unlock()
-	default:
-		return fmt.Errorf("invalid message type: %v", pac.MsgType)
+			results <- nil
+		}(id)
 	}
-	return nil
+	for range p.Peers {
+		if e := <-results; e != nil {
+			err = e
+		}
+	}
+	return err
 }
-
-func (p *Consistent) InitElection() {
-	p.Mutex.Lock()
-    p.Election = true
-    p.ElectionResponses[p.ID] = p.HighestApplied
-    p.Mutex.Unlock()
-	for _, peerID := range p.Peers {
-        go p.SendFunc(peerID, Packet{MsgType: ServerReformationInvite, Msg: ReformationInvite{SourceID: p.ID}})
-    }
+func (p *Consistent) Receive(ctx context.Context, packet Packet) Packet {
+	out := Packet{}
+	switch packet.Kind {
+	case "status":
+		var e error
+		out.Sequence, out.Hash, e = p.State.Position()
+		if e != nil {
+			out.Error = e.Error()
+		}
+	case "deliver":
+		if p.ID == p.Sequencer || packet.Sender != p.Sequencer || packet.Record == nil {
+			out.Error = "invalid sequencer delivery"
+			break
+		}
+		if e := p.State.Deliver(*packet.Record); e != nil {
+			out.Error = e.Error()
+		}
+		out.Sequence, out.Hash, _ = p.State.Position()
+	case "submit":
+		if p.ID != p.Sequencer || packet.Command == nil {
+			out.Error = "not the configured sequencer"
+			break
+		}
+		r, e := p.Write(ctx, *packet.Command)
+		out.Result = r
+		if e != nil {
+			out.Error = e.Error()
+		}
+	case "fence":
+		if p.ID != p.Sequencer {
+			out.Error = "not the configured sequencer"
+			break
+		}
+		seq, e := p.Fence(ctx)
+		out.Sequence = seq
+		if e != nil {
+			out.Error = e.Error()
+		}
+	default:
+		out.Error = "unknown peer message"
+	}
+	return out
 }

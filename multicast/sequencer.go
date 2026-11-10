@@ -1,67 +1,101 @@
-// sequencer.go
-// functions unique to the sequencer
 package multicast
 
 import (
-	"sync"
+	"context"
 	"time"
 )
 
-type Sequencer struct {
-	Mutex         sync.Mutex
-	CurrentSeq    int64
-	Batch         []SetRequest
-	BatchSize     int
-	MulticastChan chan TOMulticast
-	Timeout   	  time.Duration
-	Timer         *time.Timer
+type pendingWrite struct {
+	command Command
+	ctx     context.Context
+	done    chan writeResult
+}
+type writeResult struct {
+	result Result
+	err    error
 }
 
-func NewSequencer(batchSize int, timeout time.Duration) *Sequencer {
-	s := &Sequencer{CurrentSeq: 0, BatchSize: batchSize, Timeout: timeout, MulticastChan: make(chan TOMulticast, 100), Batch: make([]SetRequest, 0, batchSize)}
-	return s
-}
-
-func (s *Sequencer) AddSet(req SetRequest) {
-	s.Mutex.Lock()
-	defer s.Mutex.Unlock()
-	s.Batch = append(s.Batch, req)
-	if len(s.Batch) >= s.BatchSize {
-		s.TriggerMulticast()
-	} else if len(s.Batch) == 1 {
-		s.ResetTimer()
+// One owner assigns batch sequence numbers. There is no automatic promotion.
+func (p *Consistent) runSequencer() {
+	defer close(p.stopped)
+	for {
+		var first pendingWrite
+		select {
+		case <-p.ctx.Done():
+			return
+		case first = <-p.queue:
+		}
+		writes := []pendingWrite{first}
+		timer := time.NewTimer(p.flush)
+	collect:
+		for len(writes) < p.batchSize {
+			select {
+			case w := <-p.queue:
+				writes = append(writes, w)
+			case <-timer.C:
+				break collect
+			case <-p.ctx.Done():
+				timer.Stop()
+				return
+			}
+		}
+		timer.Stop()
+		live := writes[:0]
+		for _, w := range writes {
+			if err := w.ctx.Err(); err != nil {
+				w.done <- writeResult{err: err}
+			} else {
+				live = append(live, w)
+			}
+		}
+		if len(live) == 0 {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(p.ctx, p.timeout)
+		select {
+		case p.order <- struct{}{}:
+		case <-ctx.Done():
+			for _, w := range live {
+				w.done <- writeResult{err: ctx.Err()}
+			}
+			cancel()
+			continue
+		}
+		err := p.synchronize(ctx)
+		if err == nil {
+			seq, hash, e := p.State.Position()
+			err = e
+			if err == nil {
+				commands := make([]Command, 0, len(live))
+				for _, w := range live {
+					_, known, e := p.State.Receipt(w.command)
+					if e != nil {
+						err = e
+						break
+					}
+					if !known {
+						commands = append(commands, w.command)
+					}
+				}
+				if err == nil && len(commands) > 0 {
+					record := Record{Sequence: seq + 1, Previous: hash, Batch: commands}
+					record.Hash = record.Digest()
+					err = p.State.Deliver(record)
+					if err == nil {
+						err = p.synchronize(ctx)
+					}
+				}
+			}
+		}
+		for _, w := range live {
+			result := Result{}
+			resultErr := err
+			if err == nil {
+				result, _, resultErr = p.State.Receipt(w.command)
+			}
+			w.done <- writeResult{result: result, err: resultErr}
+		}
+		<-p.order
+		cancel()
 	}
-}
-
-func (s *Sequencer) TriggerMulticast() {
-	if len(s.Batch) == 0 {
-		return
-	}
-	s.CurrentSeq++
-	msg := TOMulticast{SequenceNumber: s.CurrentSeq, Batch: s.Batch}
-	s.Batch = make([]SetRequest, 0, s.BatchSize)
-	if s.Timer != nil {
-		s.Timer.Stop()
-	}
-	s.MulticastChan <- msg
-}
-
-func (s *Sequencer) ResetTimer() {
-	if s.Timer != nil {
-		s.Timer.Stop()
-	}
-	s.Timer = time.AfterFunc(s.Timeout, func() {
-		s.Mutex.Lock()
-		defer s.Mutex.Unlock()
-		s.TriggerMulticast()
-	})
-}
-
-func (s *Sequencer) GetCurrentSeq() int64 {
-	s.Mutex.Lock()
-	defer s.Mutex.Unlock()
-	if len(s.Batch) > 0 {
-		return s.CurrentSeq + 1
-	}
-	return s.CurrentSeq
 }

@@ -1,0 +1,10 @@
+{
+  "timestamp_utc": "2026-11-10T01:29:57Z",
+  "scope": "three separate server processes, real TCP and HTTP, dedicated temporary bbolt stores; no Docker, external Memcached or TLS",
+  "cross_replica_reads": true,
+  "missing_replica_fails_closed": true,
+  "missing_sequencer_fails_closed": true,
+  "all_process_restart_recovery": true,
+  "durable_idempotency": true,
+  "command_line_client": true
+}

@@ -1,120 +1,123 @@
-# Replicated Cache RPC
+# Totally Ordered Replicated Memcached
 
-A typed JSON-RPC service for an ordered, replicated key/value cache. It replaces the original fixed-sequencer experiment's serving path with quorum-committed writes, leader-gated reads, persistent recovery and bounded request handling. The original experiment remains available for comparison.
+A replicated key/value cache built around a fixed sequencer and total-order multicast. Concurrent writes receive a shared batch sequence, replicas apply that sequence in order, and reads use a read-index barrier before returning a value. The implementation builds on an Amoeba-inspired course project rather than delegating ordering to a consensus framework.
+
+There is one server implementation, one client, and one replication protocol.
 
 ## Architecture
 
 ```text
-Go client / JSON-RPC caller
-        |
-        v
-authenticated HTTP/TLS API -> elected Raft leader -> majority log commit
-        |                         |                     |
-        |                    deterministic state     other voters
-        |                         |
-        +--- Get -> quorum check + apply barrier -> authoritative value
-                                      |
-                            optional Memcached read cache
+                       fixed sequencer (any configured ID)
+                      /         |          \
+client -> HTTP RPC -> forward -> batch + sequence
+                               /     |     \
+                         ordered TCP multicast
+                           /         |        \
+                        replica   replica   replica
+                           |         |         |
+                        durable ordered state + optional local Memcached
+
+GET at any replica -> sequencer read barrier -> catch up -> local read
 ```
 
-- **RPC:** `Cache.Get`, `Cache.Set`, `Cache.Delete`; JSON-RPC 2.0 profile with mandatory string IDs, named parameters, no notifications or batch requests. The Go client reuses HTTP connections, validates response IDs and tries the configured endpoints with the same request ID.
-- **Replication:** HashiCorp Raft supplies election, ordered log replication and majority commit. Followers reject reads/writes instead of silently returning stale results. A failed leader can be replaced when a majority remains. Without quorum, requests fail rather than claiming success.
-- **Recovery:** BoltDB stores Raft logs and stable metadata. File snapshots persist values and retry receipts; restore and log replay recover state. Only a fresh cluster is bootstrapped, on one node, with its entire static membership.
-- **Retries:** identical write IDs return their previous result. Reusing an ID for different input is rejected. Receipts survive snapshots/restart, but only the most recent 10,000 unique writes are retained. This is a bounded idempotency window, not unlimited exactly-once execution. A timeout may mean the write committed: retry the same ID promptly, not a new one.
-- **Cache correctness:** the Raft state machine is authoritative. Memcached is optional acceleration, never the only copy of acknowledged data. Cache keys include a digest of the key and current value; returned bytes are checked. Eviction, invalidation, cache restart or cache outage cannot substitute a stale value or turn a committed key into a miss. Reads still require a reachable elected leader.
-- **Resource controls:** 32 KiB RPC bodies, 16 KiB values, 200-byte keys, 10,000 live keys, 128 in-flight operations, bounded HTTP lifetimes and backend cache deadlines. Detached operations keep their admission slot until completion, so client disconnects cannot create unlimited workers. Capacity errors and overload are explicit.
+- **Total order:** a single configured sequencer batches up to five writes, flushing after 2 ms when the batch is not full. Each batch has a monotonically increasing sequence and a hash linking it to the previous record. Every replica applies exactly that ordered prefix. Batch size and flush delay are configurable.
+- **Transport:** logical multicast is implemented by TCP fan-out to the static members, not IP multicast. Sequencer and member IDs come from configuration; no operation assumes node 1.
+- **Acknowledgments:** successful writes have been durably applied by **all configured replicas**. A missing replica causes an explicit error, not an acknowledgment of partial replication. A timeout can still have an unknown write outcome; retry with the same request ID.
+- **Read barriers:** a replica contacts the sequencer, which synchronizes the configured replicas before returning its applied index. The reader waits for that index locally with a deadline. A missing key and an unavailable cluster are different outcomes.
+- **Out-of-order delivery:** bounded buffering holds future sequence numbers until the gap is filled. Duplicate deliveries are harmless; conflicting history is rejected. A recovering replica fetches missing records from the sequencer during the next write or read barrier.
+- **Durability and retries:** each replica atomically stores ordered records, values, applied index and retry receipts in bbolt. Identical write IDs return the original result; reusing an ID for a different command is rejected. The receipt window is the latest 10,000 distinct write IDs, not an unlimited exactly-once guarantee.
+- **Memcached:** each replica can have a dedicated Memcached read cache. Durable ordered state remains authoritative, so eviction or a cache outage cannot become silent data loss. Content-derived keys and byte validation prevent an old cached value from replacing current data. This integration does not bypass read barriers or promise a cache speedup.
+- **Bounded serving:** authenticated HTTP/TLS JSON-RPC, framed/authenticated peer TCP, deadlines, admission limits, and bounded command sizes. The HTTP client reuses connections and matches response IDs; there is no concurrent sharing of a raw encoder/decoder or unsafe hedged write.
 
-## Run a local cluster
+## Project layout
 
-Requirements: Docker Desktop/Engine and Compose. Build/test without Docker requires Go 1.27.3 (minimum module language version is in `go.mod`).
+```text
+cmd/server/       server entry point, configuration and shutdown
+cmd/client/       command-line RPC client
+multicast/        fixed-sequencer ordering, batching, read barriers and durable state
+rpcache/          HTTP API, bounded peer TCP transport and reusable Go client
+scripts/          disposable Compose verification
+reports/          measurements and their exact conditions
+compose.yaml      three replicas, independent volumes and three local Memcached services
+```
 
-Set a **random secret**, then start the three voters and an isolated Memcached service:
+## Run
+
+Requirements: Go 1.26 or newer; the pinned development/CI toolchain is Go 1.27.3. Docker Desktop/Engine with Compose is sufficient for the container deployment.
 
 ```ps
 $env:RPCACHE_TOKEN = 'replace-with-a-random-secret-at-least-24-characters'
 docker compose up -d --build
-```
-
-The RPC ports are published **only on loopback**: 8001, 8002, 8003. Raft and Memcached ports are private to the Compose network. Bootstrap runs only on n1; existing storage is reused after restart. Separate volumes keep each voter's logs and snapshots independent.
-
-```ps
-go run ./cmd/rpcctl -method Cache.Set -key example -value hello -id write-001
-go run ./cmd/rpcctl -method Cache.Get -key example -id read-001
-go run ./cmd/rpcctl -method Cache.Delete -key example -id delete-001
-docker compose stop n1
-go run ./cmd/rpcctl -method Cache.Get -key example -id read-002
-docker compose up -d n1
+go run ./cmd/client -method Cache.Set -key example -value hello -id write-001
+go run ./cmd/client -method Cache.Get -key example -id read-001
+go run ./cmd/client -method Cache.Delete -key example -id delete-001
 docker compose down
 ```
 
-Do not add `--volumes` to shutdown unless intentionally destroying all stored state. A majority must retain its durable data for normal recovery; do not bootstrap a new cluster on top of surviving members.
+HTTP ports 8001–8003 bind only to loopback. Peer ports and Memcached are private to the Compose network. Each node owns a separate persistent volume; ordinary `down` preserves these volumes. `down --volumes` permanently deletes state and should only be used for disposable data.
 
-Direct development without containers:
+Single-node development uses the same implementation, without replication fault tolerance:
 
 ```ps
 $env:RPCACHE_TOKEN = 'replace-with-a-random-secret-at-least-24-characters'
-go run ./cmd/rpcd -id n1 -raft 127.0.0.1:9001 -http 127.0.0.1:8001 -data data/n1 -bootstrap
+go run ./cmd/server -id local -sequencer local -peer 127.0.0.1:9001 -http 127.0.0.1:8001 -data data/local '-peers={"local":"127.0.0.1:9001"}'
 ```
 
-This is a single-voter development deployment with no failover. Omit `-memcached` to use authoritative state alone; add `-memcached 127.0.0.1:11211` to enable the read cache.
+Add `-memcached 127.0.0.1:11211` for an optional local cache. Use `-tls-cert` and `-tls-key` for HTTP TLS. Store/rotate the token outside source control; all peers in a cluster use the same service token.
 
-## Wire contract
+The persistent node ID, fixed sequencer and static membership are checked on startup. Do not repoint an existing node's data directory at another membership or promote a replica by changing flags. An incompatible database directory is rejected; use a fresh directory and retain any previous volumes until you have intentionally exported or retired their data.
 
-POST `/rpc` with `Authorization: Bearer <RPCACHE_TOKEN>` and JSON:
+## API
+
+POST `/rpc` with `Authorization: Bearer <RPCACHE_TOKEN>`:
 
 ```json
-{"jsonrpc":"2.0","id":"unique-write-id","method":"Cache.Set","params":{"key":"example","value":"hello"}}
+{"jsonrpc":"2.0","id":"write-001","method":"Cache.Set","params":{"key":"example","value":"hello"}}
 ```
 
 ```json
-{"jsonrpc":"2.0","id":"unique-write-id","result":{"found":true,"revision":3}}
+{"jsonrpc":"2.0","id":"write-001","result":{"found":true,"revision":1}}
 ```
 
-Revisions are Raft log indexes, not a contiguous write count. Get returns `found:false` for a missing key; an unavailable leader is an error, never a cache miss. Application errors use the JSON-RPC `error` field. HTTP 401 means invalid credentials; HTTP 429 means admission capacity is exhausted. Unknown methods, malformed schemas and invalid key/value limits are rejected before entering the replicated log. Stable string IDs are mandatory; rejected requests that cannot supply one use the empty string in the error response.
+Methods are `Cache.Set`, `Cache.Get`, and `Cache.Delete`. A revision is a **batch sequence**, not a count of individual writes. Named parameters and nonempty string IDs are required; notifications and JSON-RPC batches are unsupported. `found:false` is a normal cache miss; unavailable replication is an error. Preserve a write ID after an ambiguous timeout and retry promptly inside the receipt window.
 
-GET `/livez` reports process liveness. GET `/readyz` is successful only on a verified leader, suitable for a leader-aware load balancer. GET `/metrics` requires the bearer token and exports Prometheus-style request/error counters. Do not log bearer tokens, user values or TLS private keys.
+- GET `/livez`: process liveness.
+- GET `/readyz`: read barrier succeeds with every configured replica; returns 503 otherwise.
+- GET `/metrics`: authenticated Prometheus-style request/error counters.
 
-## Verify and measure
+Defaults: 128 KiB HTTP bodies, 16 KiB values, 200-byte non-whitespace keys, 128-byte IDs, 10,000 live keys, 128 queued writes, 128 in-flight HTTP requests and 128 peer handlers per node. Peer frames are capped at 2 MiB to accommodate a full 16-write batch even when JSON escaping expands the values. Reordering is limited to 128 records ahead. The journal stops accepting new batches at 100,000 records; it is not compacted automatically. Plan bounded workloads, disk monitoring and operator-managed retention rather than treating it as an unlimited database.
 
-```powershell
+## Verify
+
+```ps
 go vet ./...
 go test -race -count=1 -timeout=180s ./...
-go build ./cmd/rpcd ./cmd/rpcctl
-```
-
-Tests exercise real TCP Raft transports and temporary persistent stores: leader loss, loss of quorum, follower read rejection, snapshot/restart, durable idempotency, conflicting retry IDs, concurrent read-after-write, TLS requests, malformed/oversized input, authentication, backpressure, cancellation, ambiguous-write retry and cache outages. Set `MEMCACHED_ADDR` to run the external legacy wrapper check and actual cache reuse check. CI provides a Memcached service and enables the race detector.
-
-For the reproducible **local** RPC load experiment:
-
-```powershell
+go build ./cmd/server ./cmd/client
 $env:RPCACHE_REPORT = 'reports/local-load.json'
 go test ./rpcache -run TestRPCLocalLoad -count=1 -v
+python scripts/verify_compose.py
 ```
 
-The fixture issues 500 SET/GET pairs from 20 concurrent clients, each using a separate key, through HTTP into three real Raft voters with durable BoltDB. Every GET is checked against its acknowledged write. Timings include RPC, quorum commit and read barriers, but exclude TLS, Memcached and WAN traffic. This is a same-host development measurement, not a throughput SLA or a proof covering all possible histories. [Recorded results and conditions](reports/VALIDATION.md).
+For an isolated local three-process deployment check without Docker, build the executables and run:
 
-## Deployment boundaries
+```ps
+go build -o bin/server.exe ./cmd/server
+go build -o bin/client.exe ./cmd/client
+python scripts/verify_local.py
+```
 
-The hardened path is `cmd/rpcd`; **do not deploy `cmd/server` or `cmd/client`**, which are preserved course experiments. This repository supplies a deployable private-network service and verification evidence, not a claim of audited public production use.
+On Linux/macOS, omit `.exe`. The script creates private temporary stores, starts only its own processes, and removes its disposable state after verifying recovery.
 
-Before operating outside the local Compose topology:
+The Compose script stops/restarts only this project's services and deletes its own unique test key; run it against disposable development state. Set `MEMCACHED_ADDR` to exercise a real external Memcached in the Go tests. Recorded measurements and their scope are in [reports/VALIDATION.md](reports/VALIDATION.md).
 
-1. Use `-tls-cert` and `-tls-key` (or a trusted TLS terminator) for RPC. Store and rotate `RPCACHE_TOKEN` outside source control. This version has one shared service token, not per-user RBAC.
-2. Keep Raft transport and Memcached on a trusted, isolated network. The current Raft TCP transport is **not encrypted or authenticated**; Internet-facing Raft ports are unsupported. Native mTLS for peer traffic, hostile-peer protection and dynamic membership are not implemented.
-3. Use independent persistent disks/hosts across failure domains. A three-container demo on one computer cannot tolerate failure of that computer. Back up volumes, monitor free disk/memory and test recovery from backups. The 10,000-key/value cap and bounded receipts are intentional, not an unlimited cache product.
-4. Reads are leader-routed and perform a quorum verification plus apply barrier; they do not scale across arbitrary followers. Losing a majority sacrifices availability. This is not an implementation of the original Amoeba membership protocol and does not claim Byzantine fault tolerance.
-5. Memcached lookup follows an authoritative state lookup and thus does not avoid quorum checks or promise a speedup. The optional cache integration demonstrates safe failure semantics; the load report does not attribute its performance to Memcached.
+## Availability and deployment boundaries
 
-## Original experiment and provenance
+This is a fixed-membership, crash-recovery service for a **trusted private network**. It does not elect a replacement sequencer. If the sequencer or any configured replica is unavailable, reads/writes fail until the original member returns and catches up. A lost sequencer disk requires operator recovery from backups; do not force-promote another node or bootstrap a divergent history.
 
-`multicast/`, `memcached/wrapper.go`, `cmd/server/` and `cmd/client/` preserve the April 2026 course prototype. It explored Amoeba-inspired fixed-sequencer total-order multicast, read-index barriers and SET batching against asynchronous replication. The course report measured GET/client-log agreement from 89.66% to 97.93% with 50 clients. Those are **historical workload-specific figures**, not results for the new RPC path, not a formal linearizability test, and not production availability. The original election and transport code remains experimental and is not used by `rpcd`.
+Peer TCP authenticates a shared token but is not encrypted or individually authenticated. Keep it isolated; a compromised authorized peer is outside the fault model. Expose only TLS-protected RPC behind appropriate access controls. There is one service token, not per-user RBAC. A three-container deployment on one computer cannot survive failure of that computer. Use independent hosts/disks, backups and monitoring for operational deployments.
 
-The RPC version uses HashiCorp Raft rather than claiming to have implemented consensus from scratch. Project code covers RPC contracts, replicated state transitions, idempotency, snapshot state, safe cache integration, client routing, resource admission, deployment and fault/load tests. Dependency versions are locked in `go.mod`/`go.sum`; dependency licenses remain with their respective authors.
+The original course measurements (89.66% versus 97.93% GET/client-log agreement) describe an April 2026 workload and remain in Git history/course materials. They are **not** benchmark results for the current implementation and do not establish general linearizability or availability. Current measurements must be reproduced with the checked-in tests.
 
-## References
+## Reference
 
-1. M. Frans Kaashoek, Andrew S. Tanenbaum, and Kees Verstoep. **Group Communication in Amoeba and its Applications**. *Distributed Systems Engineering* 1(1), 48–58 (1993). [doi:10.1088/0967-1846/1/1/006](https://doi.org/10.1088/0967-1846/1/1/006). Inspiration for the original fixed-sequencer experiment; not a claim to reproduce the complete protocol.
-2. Diego Ongaro and John Ousterhout. **In Search of an Understandable Consensus Algorithm**. *USENIX ATC 2014*, 305–319. [Paper](https://www.usenix.org/conference/atc14/technical-sessions/presentation/ongaro), [extended version](https://raft.github.io/raft.pdf). Consensus basis for the new replicated state machine.
-3. HashiCorp. [Raft implementation](https://github.com/hashicorp/raft) and [raft-boltdb durable store](https://github.com/hashicorp/raft-boltdb). These libraries implement the underlying consensus/storage algorithms.
-
-Machine-readable paper entries: [references.bib](references.bib).
+M. Frans Kaashoek, Andrew S. Tanenbaum, and Kees Verstoep. **Group Communication in Amoeba and its Applications.** *Distributed Systems Engineering* 1(1), 48–58 (1993). [doi:10.1088/0967-1846/1/1/006](https://doi.org/10.1088/0967-1846/1/1/006). The ordering design is inspired by fixed-sequencer total-order multicast; it is not the complete Amoeba membership/reformation protocol. Bibliographic entry: [references.bib](references.bib).

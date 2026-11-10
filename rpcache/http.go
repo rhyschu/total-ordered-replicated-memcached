@@ -51,8 +51,10 @@ func (s *Service) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /livez", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("alive\n")) })
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
-		if s.node.Raft.VerifyLeader().Error() != nil {
-			http.Error(w, "not the ready leader", 503)
+		ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+		defer cancel()
+		if s.node.Ready(ctx) != nil {
+			http.Error(w, "ordered replication unavailable", 503)
 			return
 		}
 		w.Write([]byte("ready\n"))
@@ -106,7 +108,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	var req Request
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32768))
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128<<10))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
 		s.reply(w, "", nil, -32600, "invalid or oversized request")
@@ -128,7 +130,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 		s.reply(w, req.ID, nil, -32602, "invalid key or value exceeds 16 KiB")
 		return
 	}
-	// Bound the HTTP lifetime even if an accepted Raft operation outlives its caller.
+	// Bound the HTTP lifetime even if an accepted ordered write outlives its caller.
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
 	type outcome struct {
@@ -143,14 +145,14 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 			v, e := s.node.Read(req.Params.Key, 2*time.Second)
 			done <- outcome{v, e}
 		} else {
-			v, e := s.node.Write(Command{req.ID, req.Method, req.Params.Key, req.Params.Value}, 2*time.Second)
+			v, e := s.node.Write(Command{ID: req.ID, Op: req.Method, Key: req.Params.Key, Value: req.Params.Value}, 2*time.Second)
 			done <- outcome{v, e}
 		}
 	}()
 	select {
 	case out := <-done:
 		if out.e != nil {
-			s.reply(w, req.ID, nil, -32001, "unavailable or not leader; retry same request ID on elected leader")
+			s.reply(w, req.ID, nil, -32001, "ordered replication unavailable; retry the same request ID")
 			return
 		}
 		if out.r.Error != "" {

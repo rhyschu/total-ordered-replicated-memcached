@@ -1,127 +1,84 @@
-// server main.go
 package main
 
 import (
-	"total-ordered-replicated-memcached/memcached"
-	"total-ordered-replicated-memcached/multicast"
-	"time"
-	"fmt"
+	"context"
+	"encoding/json"
+	"errors"
 	"flag"
-	"strings"
-	"encoding/gob"
-	"net"
-	"math/rand"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/bradfitz/gomemcache/memcache"
+	"total-ordered-replicated-memcached/rpcache"
 )
 
-func main() {
-
-	id := flag.Int("id", 1, "Server ID")
-	port := flag.String("port", "8001", "Port")
-	mcID := flag.String("mc", "21211", "Memcached ID")
-	peersGroup := flag.String("peers", "", "Peers port, preceded by ':' and separated by ',")
-	consistent := flag.Bool("consistent", true, "Use consistent protocol? (default: true)")
-	isSequencer := flag.Bool("sequencer", false, "Is this the initial sequencer? (default: false)")
-	batchSize := flag.Int("batch", 1, "Batch size (default: 1)")
-	slow := flag.Bool("slow", false, "Is this an intentionally slow server? (default: false)")
+func run() error {
+	id := flag.String("id", "n1", "Unique node ID")
+	peer := flag.String("peer", "127.0.0.1:9001", "Private TCP peer listen address")
+	bind := flag.String("http", "127.0.0.1:8001", "HTTP RPC listen address")
+	dir := flag.String("data", "data/n1", "Exclusive persistent node directory")
+	peers := flag.String("peers", `{"n1":"127.0.0.1:9001"}`, "Static ID/address map, JSON")
+	sequencer := flag.String("sequencer", "n1", "Fixed sequencer ID; identical on every node")
+	batch := flag.Int("batch", 5, "Maximum writes per ordered batch (1-16)")
+	flush := flag.Duration("flush", 2*time.Millisecond, "Maximum batching delay")
+	backend := flag.String("memcached", "", "Optional dedicated Memcached read cache")
+	cert := flag.String("tls-cert", "", "TLS certificate path")
+	key := flag.String("tls-key", "", "TLS private key path")
 	flag.Parse()
-	peers := strings.Split(*peersGroup, ",")
-
-	mcAddress := fmt.Sprintf("localhost:%s", *mcID)
-	mcClient, err := memcached.NewClient(mcAddress)
-	fmt.Printf("---Server %d connected to memcached %s---\n", *id, mcAddress)
-
-	var protocol multicast.ConsistencyProtocol
-
-	// map peer ID to address
-	peerMap := make(map[int]string)
-	curr := 0
-	for i := 1; i <= len(peers) + 1; i++ {
-		if i == *id {
-			continue
-		}
-		if curr < len(peers) && peers[curr] != "" {
-			peerMap[i] = peers[curr]
-			curr++
-		}
+	if *batch < 1 || *batch > 16 || *flush < time.Microsecond || *flush > 100*time.Millisecond {
+		return errors.New("batch must be 1-16 and flush must be 1us-100ms")
 	}
-
-	// the actual send function used by the protocol to send messages
-	sendFunc := func(targetID int, pac multicast.Packet) {
-		if *slow {
-			time.Sleep(5*time.Millisecond + time.Duration(rand.Float64()*float64(10*time.Millisecond)))
-		}
-		address, ok := peerMap[targetID]
-		if !ok {
-			fmt.Printf("Unknown target ID %d\n", targetID)
-			return
-		}
-		conn, err := net.DialTimeout("tcp", address, 5*time.Second)
-		if err != nil {
-			fmt.Printf("Failed to connect to peer %d\n", targetID)
-			if *consistent {
-				go protocol.InitElection()
-			}
-			return
-		}
-		defer conn.Close()
-		encoder := gob.NewEncoder(conn)
-		if encoder.Encode(pac) != nil {
-			fmt.Printf("Failed to encode packet to peer %d\n", targetID)
-		}
+	var members map[string]string
+	if e := json.Unmarshal([]byte(*peers), &members); e != nil {
+		return e
 	}
-
-	peerIDs := make([]int, 0, len(peerMap))
-	for pid := range peerMap {
-		peerIDs = append(peerIDs, pid)
+	token := os.Getenv("RPCACHE_TOKEN")
+	n, e := rpcache.Open(rpcache.Config{ID: *id, Address: *peer, Directory: *dir, Peers: members, Sequencer: *sequencer, Token: token, BatchSize: *batch, FlushInterval: *flush})
+	if e != nil {
+		return e
 	}
-	
-	if *consistent {
-		protocol = multicast.NewConsistent(mcClient, *id, peerIDs, sendFunc, *isSequencer, *batchSize)
+	defer n.Close()
+	if *backend != "" {
+		n.Cache = memcache.New(*backend)
+		n.Cache.Timeout = 50 * time.Millisecond
+		n.Cache.MaxIdleConns = 16
+	}
+	service, e := rpcache.NewService(n, token, 128)
+	if e != nil {
+		return e
+	}
+	server := &http.Server{Addr: *bind, Handler: service.Handler(), ReadHeaderTimeout: 2 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 8192}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	shutdownDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			deadline, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			server.Shutdown(deadline)
+		case <-shutdownDone:
+		}
+	}()
+	defer close(shutdownDone)
+	slog.Info("ordered cache starting", "node", *id, "sequencer", *sequencer, "http", *bind, "peer", *peer)
+	if *cert != "" || *key != "" {
+		e = server.ListenAndServeTLS(*cert, *key)
 	} else {
-		protocol = multicast.NewInconsistent(mcClient, *id, peerIDs, sendFunc)
+		e = server.ListenAndServe()
 	}
-
-	listener, err := net.Listen("tcp", ":"+*port)
-	if err != nil {
-		fmt.Printf("Failed to connect to port %s\n", *port)
+	if e == http.ErrServerClosed {
+		return nil
 	}
-	defer listener.Close()
-	fmt.Printf("---Server %d is connected to port %s---\n", *id, *port)
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			fmt.Printf("Accept error: %v\n", err)
-			continue
-		}
-		go handleConnection(conn, protocol)
-	}
-
+	return e
 }
-
-func handleConnection(conn net.Conn, protocol multicast.ConsistencyProtocol) {
-	defer conn.Close()
-	decoder := gob.NewDecoder(conn)
-	encoder := gob.NewEncoder(conn)
-	for {
-		var pac multicast.Packet
-		err := decoder.Decode(&pac)
-		if err != nil {
-			return
-		}
-		switch pac.MsgType {
-		case multicast.ClientGetRequest:
-			req := pac.Msg.(multicast.GetRequest)
-			packetIn := protocol.HandleClientGet(req)
-			encoder.Encode(multicast.Packet{MsgType: multicast.ClientGetResponse, Msg: packetIn})
-		case multicast.ClientSetRequest:
-			req := pac.Msg.(multicast.SetRequest)
-			packetIn := protocol.HandleClientSet(req)
-			encoder.Encode(multicast.Packet{MsgType: multicast.ClientSetResponse, Msg: packetIn})
-		default:
-			err := protocol.HandleServerMsg(pac)
-			if err != nil {
-				fmt.Printf("Server message error: %v\n", err)
-			}
-		}
+func main() {
+	if e := run(); e != nil {
+		slog.Error("server failed", "error", e)
+		os.Exit(1)
 	}
 }

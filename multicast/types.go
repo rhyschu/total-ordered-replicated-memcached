@@ -1,106 +1,64 @@
-// types.go
-// defines the message types, message structures, and the protocol interface
 package multicast
 
 import (
-	"encoding/gob"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"strings"
+	"unicode"
 )
 
-type MsgType int
+const MaxKeys = 10000
+const DedupWindow = 10000
+const MaxRecords = 100000
+const MaxBatch = 16
 
-const (
-	ClientGetRequest MsgType = iota
-	ClientSetRequest
-	ClientGetResponse
-	ClientSetResponse
-	ServerForwardSet
-	ServerTOMulticast
-	ServerRIQuery
-	ServerRIResponse
-	ServerReformationInvite
-	ServerReformationResponse
-	ServerSequencerAnnouncement
-)
+var ErrUnavailable = errors.New("sequencer or a configured replica is unavailable")
+var ErrGap = errors.New("ordered record is waiting for an earlier sequence")
 
-type GetRequest struct {
-	Key       string
-	ClientID  string
-	RequestID int64
+type Command struct {
+	ID    string `json:"id"`
+	Op    string `json:"op"`
+	Key   string `json:"key"`
+	Value string `json:"value,omitempty"`
 }
 
-type SetRequest struct {
-	Key       string
-	Value     string
-	ClientID  string
-	RequestID int64
+func (c Command) Validate() error {
+	if c.ID == "" || len(c.ID) > 128 || (c.Op != "Cache.Set" && c.Op != "Cache.Delete") || len(c.Key) == 0 || len(c.Key) > 200 || len(c.Value) > 16384 || strings.IndexFunc(c.Key, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+		return errors.New("invalid ordered command")
+	}
+	return nil
 }
 
-type GetResponse struct {
-	Value     string
-	Success   bool
-	RequestID int64
+type Result struct {
+	Value    string `json:"value,omitempty"`
+	Found    bool   `json:"found"`
+	Revision uint64 `json:"revision"`
+	Error    string `json:"error,omitempty"`
+}
+type Record struct {
+	Sequence uint64    `json:"sequence"`
+	Previous string    `json:"previous"`
+	Hash     string    `json:"hash"`
+	Batch    []Command `json:"batch"`
 }
 
-type SetResponse struct {
-	Success   bool
-	RequestID int64
-}
-
-type ForwardSet struct {
-	Request  SetRequest
-	SourceID int
-}
-
-type TOMulticast struct {
-	SequenceNumber int64
-	Batch          []SetRequest
-}
-
-type RIQuery struct {
-	RequestID int64
-	SourceID  int
-}
-
-type RIResponse struct {
-	LastSequence int64
-	RequestID    int64
-}
-
-type ReformationInvite struct {
-	SourceID int
-}
-
-type ReformationResponse struct {
-	SourceID       int
-	HighestApplied int64
-}
-
-type SequencerAnnouncement struct {
-	SequencerID int
+func (r Record) Digest() string {
+	r.Hash = ""
+	b, _ := json.Marshal(r)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 type Packet struct {
-	MsgType MsgType
-	Msg     interface{}
-}
-
-func init() {
-	gob.Register(GetRequest{})
-	gob.Register(SetRequest{})
-	gob.Register(GetResponse{})
-	gob.Register(SetResponse{})
-	gob.Register(ForwardSet{})
-	gob.Register(TOMulticast{})
-	gob.Register(RIQuery{})
-	gob.Register(RIResponse{})
-	gob.Register(ReformationInvite{})
-	gob.Register(ReformationResponse{})
-	gob.Register(SequencerAnnouncement{})
-}
-
-type ConsistencyProtocol interface {
-	HandleClientGet(req GetRequest) GetResponse
-	HandleClientSet(req SetRequest) SetResponse
-	HandleServerMsg(pac Packet) error
-	InitElection()
+	Token    string   `json:"token,omitempty"`
+	Sender   string   `json:"sender,omitempty"`
+	Kind     string   `json:"kind"`
+	Command  *Command `json:"command,omitempty"`
+	Record   *Record  `json:"record,omitempty"`
+	Sequence uint64   `json:"sequence,omitempty"`
+	Hash     string   `json:"hash,omitempty"`
+	Result   Result   `json:"result,omitempty"`
+	Error    string   `json:"error,omitempty"`
 }

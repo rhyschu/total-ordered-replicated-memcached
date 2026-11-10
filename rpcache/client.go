@@ -44,7 +44,7 @@ func (c *Client) Call(ctx context.Context, req Request) (Result, error) {
 			continue
 		}
 		var out Response
-		err = json.NewDecoder(io.LimitReader(response.Body, 65536)).Decode(&out)
+		err = json.NewDecoder(io.LimitReader(response.Body, 128<<10)).Decode(&out)
 		response.Body.Close()
 		if response.StatusCode != 200 {
 			last = fmt.Errorf("HTTP %d", response.StatusCode)

@@ -2,6 +2,8 @@ package rpcache
 
 import (
 	"bytes"
+	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,8 +18,10 @@ import (
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
-	"github.com/hashicorp/raft"
+	"total-ordered-replicated-memcached/multicast"
 )
+
+const token = "ordered-cache-test-secret-at-least-24"
 
 func address(t testing.TB) string {
 	t.Helper()
@@ -31,13 +35,13 @@ func address(t testing.TB) string {
 }
 func cluster(t testing.TB, count int) []*Node {
 	t.Helper()
-	members := map[string]string{}
+	peers := map[string]string{}
 	for i := 0; i < count; i++ {
-		members[fmt.Sprint(i)] = address(t)
+		peers[fmt.Sprint(i)] = address(t)
 	}
 	nodes := make([]*Node, count)
 	for i := range nodes {
-		n, e := Open(Config{ID: fmt.Sprint(i), Address: members[fmt.Sprint(i)], Peers: members, Directory: filepath.Join(t.TempDir(), "state"), Bootstrap: i == 0})
+		n, e := Open(Config{ID: fmt.Sprint(i), Address: peers[fmt.Sprint(i)], Peers: peers, Sequencer: "0", Token: token, Directory: filepath.Join(t.TempDir(), "state")})
 		if e != nil {
 			t.Fatal(e)
 		}
@@ -50,206 +54,133 @@ func cluster(t testing.TB, count int) []*Node {
 			}
 		}
 	})
-	leader(t, nodes)
 	return nodes
-}
-func leader(t testing.TB, nodes []*Node) *Node {
-	t.Helper()
-	end := time.Now().Add(12 * time.Second)
-	for time.Now().Before(end) {
-		for _, n := range nodes {
-			if n != nil && n.Raft.State() == raft.Leader && n.Raft.VerifyLeader().Error() == nil {
-				return n
-			}
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	t.Fatal("leader not elected")
-	return nil
 }
 func set(t testing.TB, n *Node, id, key, value string) Result {
 	t.Helper()
-	r, e := n.Write(Command{id, "Cache.Set", key, value}, time.Second)
+	r, e := n.Write(Command{ID: id, Op: "Cache.Set", Key: key, Value: value}, 2*time.Second)
 	if e != nil || r.Error != "" {
 		t.Fatalf("write: %+v %v", r, e)
 	}
 	return r
 }
-
-func TestReplicationFailoverAndQuorumLoss(t *testing.T) {
+func TestReplicationFollowerReadsAndSequencerLoss(t *testing.T) {
 	nodes := cluster(t, 3)
-	n := leader(t, nodes)
-	set(t, n, "write-1", "key", "committed")
-	for _, peer := range nodes {
-		if peer != n {
-			if _, e := peer.Read("key", time.Second); e == nil {
-				t.Fatal("follower served a strong read")
-			}
+	set(t, nodes[1], "first", "key", "value")
+	for _, n := range nodes {
+		r, e := n.Read("key", time.Second)
+		if e != nil || r.Value != "value" {
+			t.Fatalf("read: %+v %v", r, e)
 		}
 	}
-	for i, peer := range nodes {
-		if peer == n {
-			peer.Close()
-			nodes[i] = nil
-		}
+	nodes[0].Close()
+	started := time.Now()
+	if _, e := nodes[1].Read("key", 200*time.Millisecond); e == nil {
+		t.Fatal("stale read succeeded without sequencer")
 	}
-	replacement := leader(t, nodes)
-	v, e := replacement.Read("key", time.Second)
-	if e != nil || v.Value != "committed" {
-		t.Fatalf("lost committed write: %+v %v", v, e)
+	if time.Since(started) > time.Second {
+		t.Fatal("read deadline not respected")
 	}
-	set(t, replacement, "write-2", "key", "after-failover")
-	for i, peer := range nodes {
-		if peer != nil && peer != replacement {
-			peer.Close()
-			nodes[i] = nil
-		}
-	}
-	done := make(chan error, 1)
-	go func() {
-		_, e := replacement.Write(Command{"write-3", "Cache.Set", "key", "no-quorum"}, time.Second)
-		done <- e
-	}()
-	select {
-	case e := <-done:
-		if e == nil {
-			t.Fatal("write acknowledged without quorum")
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("quorum loss did not terminate write")
-	}
-	if _, e := replacement.Read("key", time.Second); e == nil {
-		t.Fatal("read accepted without quorum")
+	if _, e := nodes[1].Write(Command{ID: "two", Op: "Cache.Set", Key: "key", Value: "new"}, 200*time.Millisecond); e == nil {
+		t.Fatal("write succeeded without sequencer")
 	}
 }
-func TestSnapshotRestartAndIdempotency(t *testing.T) {
-	addr := address(t)
-	dir := t.TempDir()
-	c := Config{ID: "n", Address: addr, Directory: dir, Peers: map[string]string{"n": addr}, Bootstrap: true}
-	n, e := Open(c)
+func TestReplicaOutageCatchupAndRestart(t *testing.T) {
+	nodes := cluster(t, 3)
+	initial := set(t, nodes[0], "one", "key", "old")
+	config := nodes[2].config
+	nodes[2].Close()
+	// Simulate a lost reply after the sequencer durably orders a write, leaving a
+	// replica behind. The next fence must replay the missing ordered prefix.
+	seq, hash, _ := nodes[0].State.Position()
+	record := multicast.Record{Sequence: seq + 1, Previous: hash, Batch: []Command{{ID: "partial", Op: "Cache.Set", Key: "key", Value: "new"}}}
+	record.Hash = record.Digest()
+	if e := nodes[0].State.Deliver(record); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := nodes[0].Read("key", 300*time.Millisecond); e == nil {
+		t.Fatal("read succeeded before all replicas caught up")
+	}
+	var e error
+	nodes[2], e = Open(config)
 	if e != nil {
 		t.Fatal(e)
 	}
-	leader(t, []*Node{n})
-	first := set(t, n, "same-request", "key", "one")
-	again := set(t, n, "same-request", "key", "one")
-	if first.Revision != again.Revision {
-		t.Fatal("retry changed revision")
+	r, e := nodes[2].Read("key", time.Second)
+	if e != nil || r.Value != "new" {
+		t.Fatalf("catchup: %+v %v", r, e)
 	}
-	if r, e := n.Write(Command{"same-request", "Cache.Set", "key", "two"}, time.Second); e != nil || r.Error == "" {
-		t.Fatal("conflicting retry accepted")
+	retry := set(t, nodes[1], "one", "key", "old")
+	if retry.Revision != initial.Revision {
+		t.Fatal("retry reapplied")
 	}
-	if e := n.Raft.Snapshot().Error(); e != nil {
-		t.Fatal(e)
+	r, e = nodes[0].Read("key", time.Second)
+	if e != nil || r.Value != "new" {
+		t.Fatal("retry overwrote later write")
 	}
-	n.Close()
-	n, e = Open(c)
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer n.Close()
-	leader(t, []*Node{n})
-	r, e := n.Read("key", time.Second)
-	if e != nil || r.Value != "one" {
-		t.Fatalf("restart lost value: %+v %v", r, e)
-	}
-	if retry := set(t, n, "same-request", "key", "one"); retry.Revision != first.Revision {
-		t.Fatal("restart lost receipt")
-	}
-	r, e = n.Write(Command{"delete-1", "Cache.Delete", "key", ""}, time.Second)
-	if e != nil || !r.Found {
-		t.Fatal("delete failed")
-	}
-	r, e = n.Read("key", time.Second)
-	if e != nil || r.Found {
-		t.Fatal("deleted value returned")
-	}
-}
-
-const token = "integration-token-32-characters-long"
-
-func rpc(t testing.TB, url, body, auth string) (int, Response) {
-	t.Helper()
-	req, _ := http.NewRequest("POST", url+"/rpc", strings.NewReader(body))
-	req.Header.Set("Authorization", auth)
-	res, e := http.DefaultClient.Do(req)
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer res.Body.Close()
-	var response Response
-	if res.StatusCode == 200 {
-		if e = json.NewDecoder(res.Body).Decode(&response); e != nil {
+	configs := make([]Config, len(nodes))
+	for i, n := range nodes {
+		configs[i] = n.config
+		nodes[i] = nil
+		if e = n.Close(); e != nil {
 			t.Fatal(e)
 		}
 	}
-	return res.StatusCode, response
-}
-func TestRPCValidationAuthLimitsAndTLS(t *testing.T) {
-	nodes := cluster(t, 1)
-	n := leader(t, nodes)
-	s, _ := NewService(n, token, 1)
-	server := httptest.NewTLSServer(s.Handler())
-	defer server.Close()
-	client := server.Client()
-	req, _ := http.NewRequest("POST", server.URL+"/rpc", strings.NewReader(`{"jsonrpc":"2.0","id":"one","method":"Cache.Set","params":{"key":"x","value":"y"}}`))
-	req.Header.Set("Authorization", "Bearer "+token)
-	response, e := client.Do(req)
-	if e != nil {
-		t.Fatal(e)
-	}
-	var v Response
-	json.NewDecoder(response.Body).Decode(&v)
-	response.Body.Close()
-	if v.Error != nil || v.Result == nil {
-		t.Fatalf("TLS RPC failed: %+v", v)
-	}
-	plain := httptest.NewServer(s.Handler())
-	defer plain.Close()
-	if status, _ := rpc(t, plain.URL, `{}`, ""); status != 401 {
-		t.Fatal("missing auth accepted")
-	}
-	for _, body := range []string{`{}`, `[]`, `{"jsonrpc":"2.0","id":"bad","method":"invalid","params":{"key":"x"}}`, `{"jsonrpc":"2.0","id":"bad","method":"Cache.Set","params":{"key":"bad key"}}`, strings.Repeat("x", 40000)} {
-		if _, r := rpc(t, plain.URL, body, "Bearer "+token); r.Error == nil {
-			t.Fatalf("invalid input accepted: %.60s", body)
+	for i, c := range configs {
+		nodes[i], e = Open(c)
+		if e != nil {
+			t.Fatal(e)
 		}
 	}
-	s.slots <- struct{}{}
-	if status, _ := rpc(t, plain.URL, `{}`, "Bearer "+token); status != 429 {
-		t.Fatal("overload accepted")
+	for _, n := range nodes {
+		r, e = n.Read("key", time.Second)
+		if e != nil || r.Value != "new" {
+			t.Fatal("restart lost ordered value", e)
+		}
 	}
-	<-s.slots
-	metrics, _ := http.NewRequest("GET", plain.URL+"/metrics", nil)
-	metrics.Header.Set("Authorization", "Bearer "+token)
-	m, e := http.DefaultClient.Do(metrics)
+	if r := set(t, nodes[2], "one", "key", "old"); r.Revision != initial.Revision {
+		t.Fatal("restart lost original retry receipt")
+	}
+}
+func TestDurableRetryAndMembershipLock(t *testing.T) {
+	nodes := cluster(t, 1)
+	n := nodes[0]
+	config := n.config
+	original := set(t, n, "once", "key", "value")
+	n.Close()
+	var e error
+	nodes[0], e = Open(config)
 	if e != nil {
 		t.Fatal(e)
 	}
-	b, _ := io.ReadAll(m.Body)
-	m.Body.Close()
-	if !bytes.Contains(b, []byte("rpcache_errors_total")) {
-		t.Fatal("missing metrics")
+	retry := set(t, nodes[0], "once", "key", "value")
+	if retry.Revision != original.Revision {
+		t.Fatal("lost durable idempotency")
+	}
+	r, e := nodes[0].Write(Command{ID: "once", Op: "Cache.Set", Key: "key", Value: "different"}, time.Second)
+	if e != nil || r.Error == "" {
+		t.Fatal("conflicting ID not rejected")
 	}
 }
 func TestConcurrentReadAfterWrite(t *testing.T) {
 	nodes := cluster(t, 3)
-	n := leader(t, nodes)
 	var wg sync.WaitGroup
 	for i := 0; i < 20; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
+			n := nodes[i%3]
 			key := fmt.Sprint(i)
 			for j := 0; j < 10; j++ {
-				value := fmt.Sprint(j)
-				r, e := n.Write(Command{fmt.Sprintf("%d-%d", i, j), "Cache.Set", key, value}, time.Second)
+				v := fmt.Sprint(j)
+				r, e := n.Write(Command{ID: fmt.Sprintf("%d-%d", i, j), Op: "Cache.Set", Key: key, Value: v}, 2*time.Second)
 				if e != nil || r.Error != "" {
-					t.Errorf("write: %v %v", r, e)
+					t.Errorf("write: %+v %v", r, e)
 					return
 				}
-				v, e := n.Read(key, time.Second)
-				if e != nil || v.Value != value {
-					t.Errorf("read: %v %v", v, e)
+				out, e := nodes[(i+1)%3].Read(key, 2*time.Second)
+				if e != nil || out.Value != v {
+					t.Errorf("cross-replica read: %+v %v", out, e)
 					return
 				}
 			}
@@ -257,25 +188,210 @@ func TestConcurrentReadAfterWrite(t *testing.T) {
 	}
 	wg.Wait()
 }
-func TestMemcachedFailureDoesNotChangeResults(t *testing.T) {
+
+func TestSharedKeyOrderAndBatchFlush(t *testing.T) {
+	nodes := cluster(t, 3)
+	const clients = 50
+	start := make(chan struct{})
+	revisions := make(chan uint64, clients)
+	var wg sync.WaitGroup
+	for i := 0; i < clients; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			r, e := nodes[i%3].Write(Command{ID: fmt.Sprintf("shared-%d", i), Op: "Cache.Set", Key: "shared", Value: fmt.Sprint(i)}, 3*time.Second)
+			if e != nil || r.Error != "" {
+				t.Errorf("write failed: %+v %v", r, e)
+				return
+			}
+			revisions <- r.Revision
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(revisions)
+	seen := map[uint64]bool{}
+	count := 0
+	for r := range revisions {
+		seen[r] = true
+		count++
+	}
+	if count != clients || len(seen) >= clients {
+		t.Fatalf("no actual batching: %d writes, %d batch revisions", count, len(seen))
+	}
+	first, e := nodes[0].Read("shared", time.Second)
+	if e != nil {
+		t.Fatal(e)
+	}
+	seq, hash, _ := nodes[0].State.Position()
+	for _, n := range nodes {
+		value, e := n.Read("shared", time.Second)
+		if e != nil || value != first {
+			t.Fatal("replicas diverged", e)
+		}
+		s, h, e := n.State.Position()
+		if e != nil || s != seq || h != hash {
+			t.Fatal("ordered prefix differs", e)
+		}
+	}
+	begin := time.Now()
+	set(t, nodes[2], "single-flush", "flush", "value")
+	if time.Since(begin) > time.Second {
+		t.Fatal("partial batch did not flush promptly")
+	}
+}
+func rpc(t *testing.T, url, body, authorization string) (int, Response) {
+	t.Helper()
+	req, _ := http.NewRequest("POST", url+"/rpc", strings.NewReader(body))
+	req.Header.Set("Authorization", authorization)
+	res, e := http.DefaultClient.Do(req)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer res.Body.Close()
+	var out Response
+	json.NewDecoder(res.Body).Decode(&out)
+	return res.StatusCode, out
+}
+func TestHTTPValidationTLSAndBackpressure(t *testing.T) {
 	nodes := cluster(t, 1)
-	n := leader(t, nodes)
-	set(t, n, "one", "key", "value")
+	s, _ := NewService(nodes[0], token, 1)
+	plain := httptest.NewServer(s.Handler())
+	defer plain.Close()
+	if status, _ := rpc(t, plain.URL, `{}`, ""); status != 401 {
+		t.Fatal("missing auth accepted")
+	}
+	for _, body := range []string{`{}`, `[]`, `{"jsonrpc":"2.0","id":"bad","method":"unknown","params":{"key":"x"}}`, `{"jsonrpc":"2.0","id":"bad","method":"Cache.Set","params":{"key":"bad key"}}`, strings.Repeat("x", 40000)} {
+		if _, r := rpc(t, plain.URL, body, "Bearer "+token); r.Error == nil {
+			t.Fatalf("invalid body accepted: %.50s", body)
+		}
+	}
+	s.slots <- struct{}{}
+	if status, _ := rpc(t, plain.URL, `{}`, "Bearer "+token); status != 429 {
+		t.Fatal("unbounded admission")
+	}
+	<-s.slots
+	secure := httptest.NewTLSServer(s.Handler())
+	defer secure.Close()
+	req, _ := http.NewRequest("POST", secure.URL+"/rpc", strings.NewReader(`{"jsonrpc":"2.0","id":"tls","method":"Cache.Set","params":{"key":"key","value":"value"}}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	response, e := secure.Client().Do(req)
+	if e != nil {
+		t.Fatal(e)
+	}
+	var out Response
+	json.NewDecoder(response.Body).Decode(&out)
+	response.Body.Close()
+	if out.Result == nil || out.Error != nil {
+		t.Fatalf("TLS: %+v", out)
+	}
+}
+func TestPeerAuthenticationAndFrames(t *testing.T) {
+	nodes := cluster(t, 1)
+	n := nodes[0]
+	conn, e := net.Dial("tcp", n.config.Address)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(time.Second))
+	writePacket(conn, multicast.Packet{Kind: "status", Sender: "0", Token: "wrong"})
+	out, e := readPacket(conn)
+	if e != nil || out.Error != "unauthorized peer" {
+		t.Fatal("peer authentication failed", e)
+	}
+	var b bytes.Buffer
+	binary.Write(&b, binary.BigEndian, uint32(maxFrame+1))
+	if _, e = readPacket(&b); e == nil {
+		t.Fatal("oversized frame accepted")
+	}
+	if _, e = readPacket(strings.NewReader("x")); e != io.ErrUnexpectedEOF {
+		t.Fatal("truncated frame accepted", e)
+	}
+}
+func TestMemcachedOutageAndRealCache(t *testing.T) {
+	nodes := cluster(t, 1)
+	n := nodes[0]
+	set(t, n, "cache", "key", "value")
 	n.Cache = memcache.New("127.0.0.1:1")
 	n.Cache.Timeout = 10 * time.Millisecond
-	r, e := n.Read("key", time.Second)
-	if e != nil || r.Value != "value" {
-		t.Fatal("cache outage lost value")
+	if r, e := n.Read("key", time.Second); e != nil || r.Value != "value" {
+		t.Fatal("cache outage lost durable data")
 	}
-	if a := os.Getenv("MEMCACHED_ADDR"); a != "" {
-		n.Cache = memcache.New(a)
-		r, e = n.Read("key", time.Second)
-		if e != nil || r.Value != "value" {
-			t.Fatal("real cache read failed")
+	if addr := os.Getenv("MEMCACHED_ADDR"); addr != "" {
+		n.Cache = memcache.New(addr)
+		n.Cache.Timeout = 100 * time.Millisecond
+		for i := 0; i < 2; i++ {
+			if r, e := n.Read("key", time.Second); e != nil || r.Value != "value" {
+				t.Fatal("real cache failure")
+			}
 		}
-		r, e = n.Read("key", time.Second)
-		if e != nil || r.Value != "value" {
-			t.Fatal("cache reuse failed")
+		set(t, n, "replace", "key", "replacement")
+		if r, e := n.Read("key", time.Second); e != nil || r.Value != "replacement" {
+			t.Fatal("stale cache returned")
 		}
+	} else {
+		t.Log("external Memcached check not enabled")
+	}
+}
+func TestClientAmbiguousRetryAndCancellation(t *testing.T) {
+	nodes := cluster(t, 1)
+	n := nodes[0]
+	s, _ := NewService(n, token, 2)
+	first := true
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if first {
+			first = false
+			set(t, n, "retry", "key", "value")
+			http.Error(w, "lost reply", 503)
+			return
+		}
+		s.Handler().ServeHTTP(w, r)
+	}))
+	defer server.Close()
+	c := NewClient([]string{server.URL, server.URL}, token)
+	defer c.HTTP.CloseIdleConnections()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, e := c.Call(ctx, Request{ID: "retry", Method: "Cache.Set", Params: Params{Key: "key", Value: "value"}})
+	if e != nil || out.Revision != 1 {
+		t.Fatalf("retry: %+v %v", out, e)
+	}
+	canceled, stop := context.WithCancel(context.Background())
+	stop()
+	if _, e = c.Call(canceled, Request{ID: "cancel", Method: "Cache.Get", Params: Params{Key: "key"}}); e == nil {
+		t.Fatal("canceled request accepted")
+	}
+}
+
+func TestMaximumEscapedValueRoundtrip(t *testing.T) {
+	nodes := cluster(t, 3)
+	service, _ := NewService(nodes[1], token, 2)
+	server := httptest.NewServer(service.Handler())
+	defer server.Close()
+	client := NewClient([]string{server.URL}, token)
+	defer client.HTTP.CloseIdleConnections()
+	value := strings.Repeat("<", 16384)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if result, e := client.Call(ctx, Request{ID: "escaped-write", Method: "Cache.Set", Params: Params{Key: "escaped", Value: value}}); e != nil || !result.Found {
+		t.Fatalf("write: %+v %v", result, e)
+	}
+	if result, e := client.Call(ctx, Request{ID: "escaped-read", Method: "Cache.Get", Params: Params{Key: "escaped"}}); e != nil || result.Value != value {
+		t.Fatalf("escaped response truncated: %v", e)
+	}
+	batch := make([]Command, multicast.MaxBatch)
+	for i := range batch {
+		batch[i] = Command{ID: fmt.Sprint(i), Op: "Cache.Set", Key: fmt.Sprint(i), Value: value}
+	}
+	record := multicast.Record{Sequence: 1, Batch: batch}
+	record.Hash = record.Digest()
+	var frame bytes.Buffer
+	if e := writePacket(&frame, multicast.Packet{Kind: "deliver", Record: &record}); e != nil {
+		t.Fatal("valid maximum batch exceeds peer frame", e)
+	}
+	if p, e := readPacket(&frame); e != nil || len(p.Record.Batch) != multicast.MaxBatch {
+		t.Fatal("maximum batch cannot be decoded", e)
 	}
 }
