@@ -1,0 +1,123 @@
+{
+  "trials": 5,
+  "requests": 5000,
+  "failures": 0,
+  "by_method": {
+    "Cache.Get": {
+      "requests": 2500,
+      "median_ms": 16.1065,
+      "p95_ms": 21.524
+    },
+    "Cache.Set": {
+      "requests": 2500,
+      "median_ms": 40.771,
+      "p95_ms": 49.495
+    }
+  },
+  "combined": {
+    "requests": 5000,
+    "median_ms": 25.055,
+    "p95_ms": 45.348
+  },
+  "scope": "3 fixed-sequencer total-order multicast nodes; real framed TCP, per-node durable bbolt transactions, loopback HTTP RPC, 20 clients, 500 SET/GET pairs; batching=5, flush=2ms; all replicas acknowledge; no Memcached, TLS or WAN in timing",
+  "toolchain": "go1.27.3",
+  "os": "windows",
+  "aggregation": "Pool all samples across all trials; median averages the middle pair; P95 is nearest rank. Not an average of trial percentiles.",
+  "runs": [
+    {
+      "file": "run-1.json",
+      "timestamp_utc": "2026-11-13T20:43:51Z",
+      "requests": 1000,
+      "failures": 0,
+      "elapsed_seconds": 1.3856915,
+      "by_method": {
+        "Cache.Get": {
+          "requests": 500,
+          "median_ms": 16.062,
+          "p95_ms": 20.79
+        },
+        "Cache.Set": {
+          "requests": 500,
+          "median_ms": 39.789,
+          "p95_ms": 45.233
+        }
+      }
+    },
+    {
+      "file": "run-2.json",
+      "timestamp_utc": "2026-11-13T20:43:54Z",
+      "requests": 1000,
+      "failures": 0,
+      "elapsed_seconds": 1.3831052,
+      "by_method": {
+        "Cache.Get": {
+          "requests": 500,
+          "median_ms": 15.824,
+          "p95_ms": 20.504
+        },
+        "Cache.Set": {
+          "requests": 500,
+          "median_ms": 39.712,
+          "p95_ms": 44.915
+        }
+      }
+    },
+    {
+      "file": "run-3.json",
+      "timestamp_utc": "2026-11-13T20:43:58Z",
+      "requests": 1000,
+      "failures": 0,
+      "elapsed_seconds": 1.4034249,
+      "by_method": {
+        "Cache.Get": {
+          "requests": 500,
+          "median_ms": 15.7775,
+          "p95_ms": 20.889
+        },
+        "Cache.Set": {
+          "requests": 500,
+          "median_ms": 40.912499999999994,
+          "p95_ms": 46.924
+        }
+      }
+    },
+    {
+      "file": "run-4.json",
+      "timestamp_utc": "2026-11-13T20:44:01Z",
+      "requests": 1000,
+      "failures": 0,
+      "elapsed_seconds": 1.4381374,
+      "by_method": {
+        "Cache.Get": {
+          "requests": 500,
+          "median_ms": 16.301499999999997,
+          "p95_ms": 22.26
+        },
+        "Cache.Set": {
+          "requests": 500,
+          "median_ms": 40.792,
+          "p95_ms": 48.96
+        }
+      }
+    },
+    {
+      "file": "run-5.json",
+      "timestamp_utc": "2026-11-13T20:44:05Z",
+      "requests": 1000,
+      "failures": 0,
+      "elapsed_seconds": 1.5536506,
+      "by_method": {
+        "Cache.Get": {
+          "requests": 500,
+          "median_ms": 17.204,
+          "p95_ms": 25.457
+        },
+        "Cache.Set": {
+          "requests": 500,
+          "median_ms": 42.285,
+          "p95_ms": 55.686
+        }
+      }
+    }
+  ]
+}

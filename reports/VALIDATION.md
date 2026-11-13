@@ -37,3 +37,19 @@ These timings exclude TLS, external Memcached, Docker and WAN traffic. Separate 
 After Docker was restarted and its access check succeeded, the full race suite was rerun with `MEMCACHED_ADDR` pointing to a dedicated Memcached 1.6.39 container on a dynamically assigned loopback port. The external-cache test verifies that reads populate the actual daemon, that subsequent reads return the correct value, that deliberately corrupted cache bytes cannot override durable state, and that a later write does not return an old cached value. The temporary daemon was removed after testing. No cache latency improvement is claimed.
 
 Container verification remains single-host. Multi-host partitions, WAN latency, long-duration soak tests and a formal linearizability checker were not exercised. Membership is static, and the fixed sequencer has no automatic failover.
+
+## November 13, 2026: separate GET and SET latency
+
+Repeated the original 20-worker, 500 SET/GET-pair workload five times on the current implementation. Each run created a fresh three-node cluster. Only measurement instrumentation changed; replication, persistence and client behavior were not modified. `go test ./...` passed before these dedicated runs.
+
+| Method | Pooled requests | Median | P95 (nearest rank) |
+|---|---:|---:|---:|
+| GET | 2,500 | 16.1065 ms | 21.524 ms |
+| SET | 2,500 | 40.771 ms | 49.495 ms |
+| Combined | 5,000 | 25.055 ms | 45.348 ms |
+
+All five trials passed with zero failed or mismatched responses. Per-method percentiles pool the raw samples; they are not averages of trial percentiles. The combined median remains close to the earlier 25.289 ms observation; this is repeatability evidence, not a claimed performance optimization.
+
+Scope: Go 1.27.3 on Windows/amd64; real peer TCP and loopback HTTP, bbolt durability, batch size 5, flush 2 ms. Clients try the sequencer endpoint first, so these figures do not characterize follower-ingress latency. Runs have fresh state and no explicit warm-up; they exclude external Memcached, TLS, Docker and WAN. The 1,000 requests in each trial contain 500 calls of each method. SET and GET failures are checked separately from timing, and no samples were dropped.
+
+[Pooled summary and trial metrics](latency-2026-11-13/summary.json), [raw per-method samples, trial 1](latency-2026-11-13/run-1.json), [source hashes](latency-2026-11-13/source-hashes.json). Trials 2–5 are stored alongside trial 1. Reproduce each trial with `RPCACHE_REPORT` set to a distinct `run-N.json` path and `go test -run '^TestRPCLocalLoad$' -count=1 -v ./rpcache`, then run `python scripts/summarize_latency.py reports/latency-2026-11-13` to pool all samples.
